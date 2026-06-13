@@ -197,25 +197,58 @@ func withFileEagerLoading(ctx context.Context, q *ent.FileQuery) *ent.FileQuery 
 
 元数据加载由 DBFS 层的 `dbfsOption` 控制（[options.go#L13](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/options.go#L13)），通过 `WithFilePublicMetadata()` 选项开启。
 
+**关键：默认列表入口默认加载公开元数据**
+
+所有列表请求通过 `manager.List()` 进入（[operation.go#L55-L91](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/manager/operation.go#L55-L91)），该方法**默认**传入 `WithFilePublicMetadata()`：
+
+```go
+func (m *manager) List(ctx context.Context, path *fs.URI, args *ListArgs) (fs.File, *fs.ListFileResult, error) {
+    opts := []fs.Option{
+        fs.WithPageSize(args.PageSize),
+        fs.WithOrderBy(args.Order),
+        fs.WithOrderDirection(args.OrderDirection),
+        dbfs.WithFilePublicMetadata(),       // ← 默认加载公开元数据
+        dbfs.WithContextHint(),
+        dbfs.WithFileShareIfOwned(),
+    }
+    ...
+    return m.fs.List(ctx, path, opts...)
+}
+```
+
+这意味着：**无论什么视图（my / share / trash / sharedWithMe），只要是列表请求，默认都会加载公开元数据**，不需要上层额外设置。
+
+在 `DBFS.List` 中（[dbfs.go#L172-L174](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L172-L174)），这个选项被转换为 Context Key：
+
+```go
+if o.loadFilePublicMetadata {
+    ctx = context.WithValue(ctx, inventory.LoadFilePublicMetadata{}, true)
+}
+```
+
 **我的文件（myNavigator）**：
-- 列表查询：根据调用方是否传入 `WithFilePublicMetadata()` 决定
-- 若为 owner，加载公开元数据已足够（因为 owner 有完整权限，元数据是否公开不影响可见性）
+- 列表查询：默认通过 `manager.List` 加载公开元数据
+- 单个文件查询：根据调用方是否传入 `WithFilePublicMetadata()` 决定（如 [file.go#L642](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/service/explorer/file.go#L642)）
 - 写操作（Rename/Copy/Move）：使用 `LoadFileMetadata` 加载全部元数据（[manage.go#L158](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L158)），确保能读取到 `sys:restore_uri`、`sys:fulltext_index` 等系统元数据
 
 **共享视图（shareNavigator）**：
+- 列表查询：通过 `manager.List` 默认加载公开元数据
 - **路径定位**时不额外设置元数据 Context，依赖上游 Context
 - **根目录加载**时设置 `LoadShareUser`、`LoadUserGroup`、`LoadShareFile`（[share_navigator.go#L115-L117](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/share_navigator.go#L115-L117)），用于加载分享和用户信息，但不加载文件元数据
-- 对于非 owner 访问者，元数据通过 `LoadFilePublicMetadata` 控制，仅加载 `is_public=true` 的元数据
+- 对于非 owner 访问者，元数据仅加载 `is_public=true` 的公开元数据
 - 单文件分享（`singleFileShare=true`）：直接通过 `GetByID` 查询，元数据加载取决于调用方的 Context 设置
 
 **回收站视图（trashNavigator）**：
+- 列表查询：通过 `manager.List` 默认加载公开元数据
 - 回收站文件**必须**加载元数据，因为 `DisplayName` 依赖 `sys:restore_uri` 元数据来显示原始文件名
-- 回收站列表查询走 `parent == nil` 的全局搜索路径，元数据加载由上游 Context 决定
+- 关键：**`sys:restore_uri` 的 `is_public` 是 `true`**，因此通过公开元数据链路即可读取（详见 3.6.2 节说明）
+- 回收站列表查询走 `parent == nil` 的全局搜索路径，查询无父级（孤儿）文件
 - 每个结果文件通过 `newTrashUri()` 重新生成用户视角路径
 
 **他人分享给我（sharedWithMeNavigator）**：
+- 列表查询：通过 `manager.List` 默认加载公开元数据
 - 设置 `args.SharedWithMe = true`（[sharewithme_navigator.go#L89](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L89)），由 inventory 层过滤共享给当前用户的文件
-- 元数据同样仅加载公开元数据
+- 元数据仅加载公开元数据（因为调用方仅传入 `WithFilePublicMetadata`）
 - 路径以 `sharedWithMe` 文件系统前缀 + hashid 文件ID 构成
 
 #### 2.3.2 列表过滤中的元数据过滤
@@ -415,30 +448,107 @@ var defaultFilter = func(ctx context.Context, f *File) (*File, bool) { return f,
 - 仅显示当前用户自己删除的文件（owner_id = 当前用户ID）
 
 **路径重写**：
-- 每个文件的用户视角路径被重写为 `newTrashUri(name)`
+- 每个文件的用户视角路径被重写为 `newTrashUri(name)` → `cloudreve://trash/{name}`
 - 不保留原始路径，只保留文件名用于展示
 
-**名称显示**：
-- 实际数据库中的 `name` 是 UUID（软删除时重命名）
-- 前端显示的名称来自 `DisplayName()`，从 `sys:restore_uri` 元数据中解析原始名称
+**名称显示与公开元数据链路**：
+
+这是一个关键的设计细节：**回收站的 `DisplayName` 依赖 `sys:restore_uri`，但该元数据是公开的**。
+
+**写入时设置 is_public=true**（[manage.go#L309-L317](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L309-L317)）：
+
+```go
+// SoftDelete 中写入回收站元数据
+fc.UpsertMetadata(ctx, target.Model, map[string]string{
+    MetadataRestoreUri: target.Uri(true).String(),          // 原始 URI
+    MetadataExpectedCollectTime: strconv.FormatInt(...),     // 预计清理时间
+}, nil);  // ← privateMask 为 nil！
+```
+
+**UpsertMetadata 中 is_public 的默认逻辑**（[file.go#L717-L726](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/inventory/file.go#L717-L726)）：
+
+```go
+isPrivate := false
+if privateMask != nil {
+    _, isPrivate = privateMask[key]
+}
+SetIsPublic(!isPrivate)  // isPrivate=false → !false=true → is_public=true
+```
+
+当 `privateMask` 为 `nil` 时，`isPrivate` 保持默认值 `false`，因此 `SetIsPublic(!false)` = `SetIsPublic(true)`。
+
+**读取链路**：
+1. `manager.List()` 默认传入 `WithFilePublicMetadata()`
+2. `DBFS.List` 设置 `LoadFilePublicMetadata=true`
+3. `withFileEagerLoading` 只加载 `is_public=true` 的元数据
+4. `MetadataRestoreUri` 的 `is_public=true`，因此被加载
+5. `DisplayName()` 读取 `Metadata()[MetadataRestoreUri]` 显示原始名称
+
+这就是为什么回收站列表不需要 `LoadFileMetadata`（加载全部元数据），仅通过 `LoadFilePublicMetadata` 就能正确显示原始文件名。
 
 #### 3.6.3 他人分享给我（sharedWithMeNavigator）
 
-**根目录过滤**：
-- 根目录是虚拟的，不对应真实文件
-- 直接查询所有共享给当前用户的文件（`SharedWithMe = true`）
+**根目录的双重身份**：
 
-**查询过滤**：
-- 设置 `args.SharedWithMe = true`，由 inventory 层添加共享过滤条件
-- 仅返回 `share.sharee` 包含当前用户的文件
+`sharedWithMeNavigator` 的根目录有两层含义，对应不同的对象：
 
-**路径重写**：
-- 每个文件的用户视角路径：`newSharedWithMeUri(hashid.EncodeFileID(fileID))`
-- 使用 hashid 编码的文件ID作为路径，不暴露真实目录结构
+| 概念 | 对应的数据库对象 | URI 路径 | 说明 |
+|------|-----------------|---------|------|
+| **实际数据库对象** | 当前用户自己的根文件夹（`t.fileClient.Root(ctx, t.user)`） | `newMyIDUri()` | 存在于 `file` 表，name=""，file_children=NULL |
+| **虚拟根（用户视角）** | 无对应数据库对象（逻辑容器） | `newSharedWithMeUri("")` → `cloudreve://sharedWithMe` | 导航器的 Path[pathIndexUser] 被覆盖为此值 |
+
+**根目录初始化代码**（[sharewithme_navigator.go#L70-L83](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L70-L83)）：
+
+```go
+if t.root == nil {
+    // 1. 实际对象：查询当前用户自己的根文件夹
+    rootFile, err := t.fileClient.Root(ctx, t.user)  // ← 实际的 File 记录
+    
+    t.root = newFile(nil, rootFile)  // ← 用真实 File 记录创建内存节点
+    // 2. 虚拟路径：覆盖为 sharedWithMe 前缀
+    rootPath := newSharedWithMeUri("")  // ← 虚拟路径 cloudreve://sharedWithMe
+    t.root.Path[pathIndexRoot], t.root.Path[pathIndexUser] = rootPath, rootPath
+    t.root.OwnerModel = t.user
+    t.root.IsUserRoot = true  // ← 标记为用户根
+}
+```
+
+**关键：虚拟根不代表真实的目录关系**
+- `sharedWithMeNavigator` 的根目录在数据库中是用户自己的根文件夹（`t.fileClient.Root`）
+- 但 `To()` 方法限制 `len(elements) > 0` 直接报错，意味着无法像普通目录那样向下遍历
+- `Children()` 传入 `parent = nil`（不是 `t.root`），查询所有共享给该用户的文件（不是查询 t.root 的子级）
+- 因此虚拟根只是一个"容器"，不参与真实的目录关系
+
+**列表查询过滤**：
+- 设置 `args.SharedWithMe = true`（[sharewithme_navigator.go#L89](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L89)），由 inventory 层添加共享过滤条件
+- 仅返回 `share.sharee` 包含当前用户的文件（即他人共享给我的文件）
+
+**虚拟路径重写**：
+
+每个结果文件的用户视角路径被重写（[sharewithme_navigator.go#L96-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L96-L98)）：
+
+```go
+res.Files[i].Path[pathIndexUser] = newSharedWithMeUri(hashid.EncodeFileID(t.hasher, res.Files[i].Model.ID))
+```
+
+**虚拟路径格式**：`cloudreve://sharedWithMe/{hashid_fileID}`
+
+- 使用 hashid 编码的文件 ID 作为路径，不暴露真实目录结构
+- 每个共享文件有独立的虚拟路径，相互之间没有层级关系
+- 这是一个"扁平列表"，不是树形目录
+
+**URI 与导航器的映射**（[dbfs.go#L738-L739](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L738-L739)）：
+
+```go
+case constants.FileSystemSharedWithMe:
+    n = NewSharedWithMeNavigator(f.user, f.fileClient, f.l, config, f.hasher)
+```
+
+当 URI 的 `FileSystem()` 为 `sharedWithMe` 时，`getNavigator` 自动选择 `sharedWithMeNavigator`。
 
 **Walk 未实现**：
 - `Walk` 方法直接返回 `errors.New("not implemented")`
-- 说明"他人分享给我"视图不支持递归遍历
+- 说明"他人分享给我"视图不支持递归遍历，因为它本质上是扁平列表
 
 ### 3.7 递归搜索
 
