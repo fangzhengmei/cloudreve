@@ -221,7 +221,11 @@ V4 中文件夹和文件统一为 `File` 实体，通过 `Type` 字段区分。
 
 #### 2.7.1 noopMigrator（46 项中的 39 项）✅[代码直接证实]
 
-`noopMigrator` 的语义是：**migrator 不负责迁移该设置项**。最终该设置项在 V4 中的值取决于 `migrateDefaultSettings()` 是否为其补了默认值：
+`noopMigrator` 的语义是：**migrator 不负责迁移该设置项**。该设置不会出现在 `migratedSettings` 列表中，因此 `migrateSettings()` 不会向 V4 写入该设置。
+
+该设置的最终值取决于阶段 2 的 `migrateDefaultSettings()` 行为——它先查询所有已存在的设置，按 name 跳过已存在项，只补齐缺失项（[migration.go#L62-L93](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/inventory/migration.go#L62-L93)）。
+
+> ⚠️ **重要区分**：`captcha_type` 不属于 noopMigrator，它有独立的值转换 migrator（[settings.go#L79-L89](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/settings.go#L79-L89)）。阶段 1 中 migrator 已经用转换后的值创建了 `captcha_type`，阶段 2 的 `migrateDefaultSettings` 发现已存在则跳过，最终值为 **migrator 转换后的值**，而非 V4 默认值。详见 2.7.3 节。
 
 **A 类：V4 DefaultSettings 中有同名项 → 最终使用 V4 默认值（V3 原值被丢弃）**
 
@@ -232,9 +236,8 @@ V4 中文件夹和文件统一为 `File` 实体，通过 `Type` 字段区分。
 | `max_parallel_transfer` | `4` | V4 默认值替代 V3 原值 |
 | `secret_key` | `RandStringRunesCrypto(256)` 随机生成 | V4 随机值替代 V3 原值 |
 | `mail_activation_template` | 基于 mailTemplateContents 重新生成的多语言 JSON | V4 重新生成替代 V3 原值 |
-| `captcha_type` | `normal` | V4 默认值替代 V3 原值（注：captcha_type 有独立 migrator，但因 DefaultSettings 先写入且 `migrateDefaultSettings` 跳过已存在项，实际走 migrator 逻辑） |
-
-> ⚠️ 关于 `mail_reset_pwd_template`：V3 中的名称是 `mail_reset_pwd_template`，V4 DefaultSettings 中的名称是 `mail_reset_template`，**名称不同**。因此 V3 的 `mail_reset_pwd_template` 由 noopMigrator 丢弃后，不会与 V4 的 `mail_reset_template` 冲突，两者独立存在。
+| `phone_required` | `"false"` | V4 默认值替代 V3 原值 |
+| `phone_enabled` | `"false"` | V4 默认值替代 V3 原值 |
 
 **B 类：V4 DefaultSettings 中无同名项 → 最终该设置在 V4 中不存在**
 
@@ -250,7 +253,14 @@ V4 中文件夹和文件统一为 `File` 实体，通过 `Type` 字段区分。
 | 自定义支付 | `custom_payment_enabled`、`custom_payment_endpoint`、`custom_payment_secret`、`custom_payment_name` |
 | 头像大小 | `avatar_size_m`、`avatar_size_s` |
 | 视图/计划任务 | `home_view_method`、`share_view_method`、`cron_recycle_upload_session` |
-| 其他 | `initial_files`、`office_preview_service`、`phone_required`、`phone_enabled` |
+| 邮件模板 | `mail_reset_pwd_template`（V4 重命名为 `mail_reset_template`，V3 原模板内容完全丢失，V4 使用全新的默认重置密码模板） |
+| 其他 | `initial_files`、`office_preview_service` |
+
+**C 类：名称变更 → V3 旧名设置被丢弃，V4 新名设置由默认值创建**
+
+| V3 设置名（被 noopMigrator 丢弃） | V4 设置名（由 DefaultSettings 创建） | 说明 |
+|---|---|---|
+| `mail_reset_pwd_template` | `mail_reset_template` | V3 重置密码模板内容丢失，V4 使用全新默认模板 |
 
 #### 2.7.2 字段名变更（2 项）✅[代码直接证实]
 
@@ -590,5 +600,5 @@ if forceReset && util.Exists(stateFilePath) {
 6. **远程策略自动建节点**：V3 远程存储策略在 V4 中需要关联 Slave Node，迁移时自动创建
 7. **步骤槽位预留**：通过 CommunityPlaceholder 常量和 State 死字段预留迁移步骤扩展点
 8. **状态文件外置**：state 文件与 V3 配置文件同目录，不依赖 V4 数据库，便于独立管理
-9. **V4 默认值体系前置**：migrateDefaultSettings 在 Migrator 前执行，部分"被丢弃"的设置实际由 V4 重新生成默认值
+9. **两阶段初始化**：migrate 命令通过 `NewRawEntClient()` 绕过 `InitializeDBClient()`，V3 数据先写入空数据库；V4 服务器首次启动时 `migrateDefaultSettings()` 等函数以"查重补缺"方式填入默认资源
 10. **部分步骤缺少事务保护**：Node 和 Group 迁移为无事务逐条写入，失败后无法安全重试
