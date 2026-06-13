@@ -187,11 +187,59 @@ func withFileEagerLoading(ctx context.Context, q *ent.FileQuery) *ent.FileQuery 
 | Context Key | 说明 |
 |-------------|------|
 | `LoadFileEntity` | 预加载实体（版本数据） |
-| `LoadFileMetadata` | 预加载全部元数据 |
-| `LoadFilePublicMetadata` | 仅预加载公开元数据（`is_public=true`） |
+| `LoadFileMetadata` | 预加载全部元数据（owner 操作时使用） |
+| `LoadFilePublicMetadata` | 仅预加载公开元数据（`is_public=true`，非 owner 视图使用） |
 | `LoadFileShare` | 预加载分享信息 |
 | `LoadFileUser` | 预加载所有者信息 |
 | `LoadFileDirectLink` | 预加载直链信息 |
+
+#### 2.3.1 不同视图下的元数据加载策略
+
+元数据加载由 DBFS 层的 `dbfsOption` 控制（[options.go#L13](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/options.go#L13)），通过 `WithFilePublicMetadata()` 选项开启。
+
+**我的文件（myNavigator）**：
+- 列表查询：根据调用方是否传入 `WithFilePublicMetadata()` 决定
+- 若为 owner，加载公开元数据已足够（因为 owner 有完整权限，元数据是否公开不影响可见性）
+- 写操作（Rename/Copy/Move）：使用 `LoadFileMetadata` 加载全部元数据（[manage.go#L158](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L158)），确保能读取到 `sys:restore_uri`、`sys:fulltext_index` 等系统元数据
+
+**共享视图（shareNavigator）**：
+- **路径定位**时不额外设置元数据 Context，依赖上游 Context
+- **根目录加载**时设置 `LoadShareUser`、`LoadUserGroup`、`LoadShareFile`（[share_navigator.go#L115-L117](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/share_navigator.go#L115-L117)），用于加载分享和用户信息，但不加载文件元数据
+- 对于非 owner 访问者，元数据通过 `LoadFilePublicMetadata` 控制，仅加载 `is_public=true` 的元数据
+- 单文件分享（`singleFileShare=true`）：直接通过 `GetByID` 查询，元数据加载取决于调用方的 Context 设置
+
+**回收站视图（trashNavigator）**：
+- 回收站文件**必须**加载元数据，因为 `DisplayName` 依赖 `sys:restore_uri` 元数据来显示原始文件名
+- 回收站列表查询走 `parent == nil` 的全局搜索路径，元数据加载由上游 Context 决定
+- 每个结果文件通过 `newTrashUri()` 重新生成用户视角路径
+
+**他人分享给我（sharedWithMeNavigator）**：
+- 设置 `args.SharedWithMe = true`（[sharewithme_navigator.go#L89](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L89)），由 inventory 层过滤共享给当前用户的文件
+- 元数据同样仅加载公开元数据
+- 路径以 `sharedWithMe` 文件系统前缀 + hashid 文件ID 构成
+
+#### 2.3.2 列表过滤中的元数据过滤
+
+搜索过滤时，元数据条件**仅匹配公开元数据**（[file_utils.go#L75-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/inventory/file_utils.go#L75-L88)）：
+
+```go
+q = q.Where(
+    file.HasMetadataWith(
+        metadata.And(
+            metadata.IsPublic(true),    // 强制仅匹配公开元数据
+            metadata.NameEQ(key),
+            ...
+        ),
+    ),
+)
+```
+
+这意味着：
+- 私有元数据（`is_public=false`）**不会**出现在搜索过滤条件中
+- 非 owner 用户无法通过搜索来探测他人的私有元数据
+- 元数据搜索条件与元数据预加载的可见范围一致
+
+#### 2.3.3 运行时读取与延迟加载
 
 **运行时读取**（[file.go#L165-L172](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/file.go#L165-L172)）：
 
@@ -333,42 +381,334 @@ var defaultFilter = func(ctx context.Context, f *File) (*File, bool) { return f,
 - 默认过滤器不过滤任何文件
 - 特定导航器可设置自定义过滤器（如共享导航器只返回共享文件夹下的文件）
 
-### 3.6 递归搜索
+### 3.6 不同视图下的过滤差异
 
-[递归搜索](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/navigator.go#L355-L522) 实现了按层级深度优先搜索：
+#### 3.6.1 共享视图（shareNavigator）
 
-1. 从目标文件夹出发，逐层展开所有子文件夹
-2. 在当前层的所有文件夹中搜索匹配的文件
-3. 当前层搜索完毕后，展开下一层文件夹继续搜索
-4. 受 `MaxRecursiveSearchedFolder` 限制，防止过度递归
-5. 分页 Token 编码了当前层级和内部分页 Token：`{level}|{innerToken}`
+**根目录过滤**：
+- 共享根目录是被分享的那个文件/文件夹（`share.Edges.File`），不是用户的完整根目录
+- 单文件分享（`singleFileShare=true`）：列表直接返回该单个文件，不查询子级
+- 文件夹分享：从分享文件夹出发，可正常向下遍历子级
+
+**能力限制过滤**：
+- `shareNavigatorCapability` 是共享视图的能力集，控制可执行操作
+- 非 owner 用户不能修改/删除共享文件（能力校验层拦截）
+- `disableView` 标志：若分享未开启预览权限且非 owner，则禁用视图功能
+
+**路径过滤**：
+- 用户视角路径从共享根开始，不暴露所有者的完整目录结构
+- 分享根的 `Path[pathIndexUser]` 被设置为 `path.Root()`，相当于虚拟根
+
+**元数据可见性**：
+- 非 owner 用户只可见 `is_public=true` 的元数据
+- 搜索过滤时元数据条件也仅匹配公开元数据
+
+#### 3.6.2 回收站视图（trashNavigator）
+
+**扁平树结构**：
+- 回收站是"扁平"的，只有一层（`len(elements) > 1` 直接返回 `ErrPathNotExist`）
+- 所有被删除的文件平铺展示，不保留原始目录层级
+- `parent == nil` 传入 `children()`，触发全局孤儿文件查询
+
+**查询过滤**：
+- 通过 `GetChildFiles` 的 `ownerID` + `nil roots` 查询无父级文件
+- 仅显示当前用户自己删除的文件（owner_id = 当前用户ID）
+
+**路径重写**：
+- 每个文件的用户视角路径被重写为 `newTrashUri(name)`
+- 不保留原始路径，只保留文件名用于展示
+
+**名称显示**：
+- 实际数据库中的 `name` 是 UUID（软删除时重命名）
+- 前端显示的名称来自 `DisplayName()`，从 `sys:restore_uri` 元数据中解析原始名称
+
+#### 3.6.3 他人分享给我（sharedWithMeNavigator）
+
+**根目录过滤**：
+- 根目录是虚拟的，不对应真实文件
+- 直接查询所有共享给当前用户的文件（`SharedWithMe = true`）
+
+**查询过滤**：
+- 设置 `args.SharedWithMe = true`，由 inventory 层添加共享过滤条件
+- 仅返回 `share.sharee` 包含当前用户的文件
+
+**路径重写**：
+- 每个文件的用户视角路径：`newSharedWithMeUri(hashid.EncodeFileID(fileID))`
+- 使用 hashid 编码的文件ID作为路径，不暴露真实目录结构
+
+**Walk 未实现**：
+- `Walk` 方法直接返回 `errors.New("not implemented")`
+- 说明"他人分享给我"视图不支持递归遍历
+
+### 3.7 递归搜索
+
+[递归搜索](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/navigator.go#L355-L522) 实现了按**广度优先（BFS）层级推进**的搜索方式，核心数据结构是 `parents` 层级数组。
+
+#### 3.7.1 核心数据结构
+
+```go
+parents := []map[int]*File{{parent.Model.ID: parent}}
+```
+
+- `parents` 是一个切片，每个元素代表一层的所有文件夹
+- 每层是一个 `map[int]*File`，key 为文件夹 ID，value 为 `dbfs.File` 对象
+- `parents[0]` = 搜索起始目录的子文件夹层
+- `walkedFolder` 记录已展开的文件夹总数，受 `MaxRecursiveSearchedFolder` 限制
+
+#### 3.7.2 层级推进函数 stepLevel
+
+`stepLevel(level int)` 负责展开 `parents[level]` 层的所有子文件夹，追加到 `parents[level+1]`：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  调用 stepLevel(0)                                          │
+│  parents[0] → 父级文件夹集合                                 │
+│      ↓ GetChildFiles(FolderOnly=true) 批量查询子文件夹       │
+│  parents[1] → 第 1 层所有文件夹（map）                       │
+│      ↓ 如未取完，用 cursor 分页继续                           │
+│  walkedFolder += len(parents[1])                            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键细节**：
+- 使用游标分页（`UseCursorPagination: true`）批量获取文件夹，避免一次性加载过多
+- 每次只展开一层（level），文件夹追加到 `parents[level+1]`
+- 若当前层文件夹全部取完（`NextPageToken == ""`），break 循环
+- 若 `walkedFolder` 超过 `MaxRecursiveSearchedFolder` 上限，停止展开
+
+**性能优化**：层级展开时**不加载元数据**：
+```go
+listCtx := context.WithValue(ctx, inventory.LoadFilePublicMetadata{}, nil)
+```
+因为文件夹仅用于路径导航，不需要元数据，减少查询开销。
+
+#### 3.7.3 搜索流程
+
+整体搜索遵循"**层级步进 + 层内搜索**"的模式：
+
+**步骤 1：解析分页 Token**
+```go
+startLevel, innerPageToken, err := parseSearchPageToken(args.Page.PageToken)
+```
+Token 格式：`{level}|{innerToken}`，用 `searchTokenSeparator` 分隔
+- `startLevel`：从第几层开始搜索
+- `innerPageToken`：该层内的游标分页 Token
+
+**步骤 2：前向步进层级**
+```go
+for level := 0; level < startLevel; level++ {
+    stop, err := stepLevel(level)
+    if stop { return &ListResult{}, nil }
+}
+```
+从第 0 层开始，一层层展开到 `startLevel`，确保 `parents[startLevel]` 已就绪。
+
+**步骤 3：层内搜索文件**
+在 `parents[startLevel]` 层的所有文件夹中搜索匹配的文件（`MixedType: true`）：
+```
+  parents[startLevel] 中的所有文件夹
+         ↓ GetChildFiles(Search + MixedType)
+       匹配的文件 + 子文件夹
+         ↓ FilterMap + listFilter
+       结果集 res
+```
+
+**步骤 4：下一层推进**
+- 当前层搜完（`PageToken == ""`）且结果未满一页 → `startLevel++`，调用 `stepLevel` 展开下一层
+- 若 `stepLevel` 返回 `finished=true`（无更多文件夹），说明全部搜索完毕
+- 若结果集填满一页（`len(res) == originalPageSize`），停止搜索，记录当前 `startLevel` 和 `PageToken`
+
+#### 3.7.4 分页 Token 生成
+
+```go
+if walkedFolder <= b.config.MaxRecursiveSearchedFolder && !stop {
+    searchRes.Pagination.NextPageToken = 
+        fmt.Sprintf("%d%s%s", startLevel, searchTokenSeparator, args.Page.PageToken)
+}
+```
+
+Token 编码了两个信息：
+- **层级位置**：当前搜索到第几层（`startLevel`）
+- **层内游标**：该层内的分页游标（`PageToken`）
+
+当后续请求带上此 Token 时，解析后从对应层级和位置继续搜索。
+
+#### 3.7.5 回收站搜索的特殊处理
+
+当 `parent == nil` 时（回收站视图），搜索走"全局搜索"路径：
+```go
+children, err := b.fileClient.GetChildFiles(ctx, &inventory.ListFileParameters{
+    PaginationArgs: args.Page,
+    MixedType:      true,
+    Search:         args.Search,
+    SharedWithMe:   args.SharedWithMe,
+}, b.user.ID, nil)
+```
+直接查询该用户所有无父级（孤儿）文件，不做层级递归。
 
 ---
 
 ## 四、重命名一致性
 
-### 4.1 重命名流程
+### 4.1 重命名完整流程
 
-[DBFS.Rename](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L150-L248) 完整流程：
+[DBFS.Rename](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L150-L248) 是一个典型的"**先锁后事务，事务提交后再更新内存**"模式，完整步骤按顺序排列如下：
 
 ```
-1. 获取导航器（需 NavigatorCapabilityRenameFile + NavigatorCapabilityLockFile）
-2. 预加载元数据（LoadFileMetadata=true）
-3. 通过路径定位目标文件
-4. 权限校验（owner only）
-5. 根目录不可重命名
-6. 验证新文件名（validateFileName）
-7. 文件类型需验证扩展名（validateExtension）和文件名正则（validateFileNameRegexp）
-8. 获取文件锁
-9. 在事务中执行 fc.Rename()
-10. 处理扩展名变更后的缩略图元数据
-11. 提交事务
-12. 发出文件重命名事件
-13. 更新内存中的 File 树结构
-14. 处理全文索引差异
+┌───────────────────────────────────────────────────────────┐
+│  阶段 1：路径定位与预加载                                   │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ 1. getNavigator — 校验 RenameFile + LockFile 能力    │  │
+│  │ 2. ctx 注入 LoadFileMetadata=true — 预加载全部元数据 │  │
+│  │ 3. getFileByPath — 导航器定位目标文件                │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────────────┬───────────────────────────────────┘
+                        │
+┌───────────────────────▼───────────────────────────────────┐
+│  阶段 2：权限与合法性校验                                   │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ 4. owner 权限校验                                    │  │
+│  │ 5. 根目录不可修改校验                                │  │
+│  │ 6. validateFileName — 文件名格式/长度/非法字符        │  │
+│  │ 7. 存储策略校验 — 扩展名白名单 + 文件名正则            │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────────────┬───────────────────────────────────┘
+                        │
+┌───────────────────────▼───────────────────────────────────┐
+│  阶段 3：获取锁                                           │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ 8. acquireByPath — 基于路径获取文件锁                │  │
+│  │    ├── lockTupleFromUri — 生成锁键 (ns/root)        │  │
+│  │    ├── 检查当前 session 是否已持有锁                  │  │
+│  │    ├── ls.Create — 调用分布式锁服务创建锁            │  │
+│  │    └── ensureConsistency — 锁后校验文件未被修改      │  │
+│  │                                                       │  │
+│  │ 9. defer Release — 函数退出时释放锁                  │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────────────┬───────────────────────────────────┘
+                        │
+┌───────────────────────▼───────────────────────────────────┐
+│  阶段 4：数据库事务                                       │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ 10. inventory.WithTx — 开启事务 + 获取事务版 client  │  │
+│  │ 11. fc.Rename — 更新文件名                           │  │
+│  │ 12. 若扩展名变更 → fc.RemoveMetadata(thumb:disabled) │  │
+│  │ 13. inventory.Commit — 提交事务                      │  │
+│  │                                                       │  │
+│  │ ⚠️ 任何一步出错 → inventory.Rollback 回滚事务        │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────────────┬───────────────────────────────────┘
+                        │
+┌───────────────────────▼───────────────────────────────────┐
+│  阶段 5：内存树与副作用更新                                │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │ 14. emitFileRenamed — 发出文件重命名事件             │  │
+│  │ 15. target.Replace(updated) — 更新内存树结构         │  │
+│  │     ├── 从 Parent.Children 删除旧名称                │  │
+│  │     ├── 用新模型创建新 File 节点                      │  │
+│  │     └── 新名称写入 Parent.Children                   │  │
+│  │ 16. 若有全文索引 → 生成 IndexDiff                    │  │
+│  └─────────────────────────────────────────────────────┘  │
+└───────────────────────────────────┬───────────────────────┘
+                                    │
+                            ┌───────▼───────┐
+                            │  函数返回     │
+                            │  (defer 解锁) │
+                            └───────────────┘
 ```
 
-### 4.2 文件名验证
+### 4.2 锁与事务的时序关系
+
+**为什么先加锁再开事务，而不是在事务内加锁？**
+
+1. **分布式锁独立于数据库事务**：锁由独立的锁服务（`f.ls`）管理，不是数据库行锁
+2. **事务前必须保证并发安全**：文件查询（`getFileByPath`）和事务之间存在时间窗口，期间文件可能被其他协程修改
+3. **锁作为外部互斥机制**：锁确保在整个操作期间，其他写操作无法进入该路径
+
+**ensureConsistency 的作用**（[lock.go#L220-L263](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/lock.go#L220-L263)）：
+
+```go
+func (f *DBFS) ensureConsistency(ctx context.Context, files ...*File) error {
+    // 查询数据库中的最新状态
+    // 对比 name / file_children / owner_id / type 是否变化
+    // 若变化 → 返回 ErrModified
+}
+```
+
+在"查询文件"和"获取锁"之间存在短暂的无保护窗口，`ensureConsistency` 通过二次校验填补这个窗口，确保文件在加锁前未被修改。
+
+### 4.3 事务与内存树更新的时序
+
+**为什么事务提交后才更新内存树？**
+
+1. **事务可能回滚**：如果在事务内更新内存树，事务回滚时内存树已经变了，会导致不一致
+2. **内存树无事务机制**：`dbfs.File` 的 `Children` map 是纯内存结构，没有回滚能力
+3. **提交即永久**：事务提交成功后，数据库状态是最终状态，此时更新内存树才安全
+
+**内存树更新的具体操作**（[file.go#L251-L272](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/file.go#L251-L272)）：
+
+```go
+func (f *File) Replace(model *ent.File) *File {
+    f.mu.Lock()
+    delete(f.Parent.Children, f.Model.Name)  // 删除旧名称映射
+    f.mu.Unlock()
+
+    defer f.Recycle()
+    replaced := newFile(f.Parent, model)      // 新节点自动写入 Parent.Children
+    if f.IsRootFile() {
+        replaced.Path[pathIndexUser] = f.Path[pathIndexUser]
+    }
+    return replaced
+}
+```
+
+**关键要点**：
+- `newFile` 构造函数内部会自动将新文件添加到父节点的 `Children` map 中
+- 旧节点通过 `defer f.Recycle()` 标记为可回收
+- 操作持有父节点的互斥锁（`f.mu`），保证并发安全
+
+### 4.4 锁的层级与作用域
+
+**锁键构成**（[lock.go#L317-L325](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/lock.go#L317-L325)）：
+
+```go
+func lockTupleFromUri(uri *fs.URI, u *ent.User, hasher hashid.Encoder) (string, string, string) {
+    ns := id + "/" + string(uri.FileSystem())  // 命名空间：用户ID/文件系统类型
+    root := uri.Path()                         // 锁根：路径
+    return ns, root, ns + "/" + root           // 完整锁键
+}
+```
+
+**锁的类型**：
+- `ZeroDepth=false`：锁定路径及其所有子级（递归锁）
+- `ZeroDepth=true`：仅锁定该路径本身（非递归）
+
+**LockSession 栈结构**：
+```go
+type LockSession struct {
+    Tokens     map[string]string  // 所有已获取的锁 token
+    TokenStack [][]string         // 栈式管理，每层一个 token 列表
+}
+```
+- 每次进入新的锁作用域，`TokenStack` push 一层
+- `Release` 只释放当前栈层的锁
+- 支持嵌套锁操作，内层释放不影响外层
+
+### 4.5 重命名错误处理与回滚
+
+| 阶段 | 失败操作 | 回滚方式 |
+|------|---------|---------|
+| 路径定位 | `getFileByPath` 失败 | 直接返回错误，无副作用 |
+| 校验 | 文件名/扩展名非法 | 直接返回错误，无副作用 |
+| 获取锁 | `acquireByPath` 失败 | 返回冲突错误，锁已自动释放 |
+| 事务内 | `Rename` 或 `RemoveMetadata` 失败 | `inventory.Rollback(tx)` 回滚数据库 |
+| 事务提交 | `Commit` 失败 | 返回错误，内存树未更新 |
+| 内存树更新 | `Replace` 失败 | 理论上不会失败（纯内存操作） |
+| 事件发送 | `emitFileRenamed` 失败 | 不影响重命名结果（事件异步） |
+
+**原子性保证**：数据库事务保证了文件重命名 + 元数据删除的原子性；锁保证了并发安全；内存树更新在事务提交后执行，保证最终一致性。
+
+### 4.6 文件名验证
 
 [validateFileName](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/validator.go#L17-L31)：
 
@@ -391,13 +731,13 @@ func validateFileName(name string) error {
 
 **文件名正则验证**（[validator.go#L47-L62](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/validator.go#L47-L62)）：根据存储策略的 `NameRegexp` 和 `IsNameRegexpDenyList` 设置校验。
 
-### 4.3 数据库级一致性保证
+### 4.7 数据库级一致性保证
 
 **唯一约束**：`UNIQUE(file_children, name)` 确保同一目录下不存在同名文件。
 
 **冲突处理**：Rename 调用 `fc.Rename()` 时，若违反唯一约束会返回 `ent.IsConstraintError`，上层转换为 `fs.ErrFileExisted`。
 
-### 4.4 扩展名变更时的元数据清理
+### 4.8 扩展名变更时的元数据清理
 
 当文件重命名导致扩展名变更时（[manage.go#L219-L224](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L219-L224)）：
 
@@ -411,7 +751,7 @@ if target.Type() == types.FileTypeFile && !strings.EqualFold(filepath.Ext(newNam
 
 扩展名改变后，原有的 `thumb:disabled` 标记会被移除，因为新文件类型可能需要重新生成缩略图。
 
-### 4.5 内存树结构的一致性维护
+### 4.9 内存树结构的一致性维护
 
 [File.Replace](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/file.go#L251-L264) 方法确保内存中的树结构与数据库同步：
 
@@ -435,7 +775,7 @@ func (f *File) Replace(model *ent.File) *File {
 2. **创建新节点**：`newFile` 会自动将新名称写入 `Parent.Children`
 3. **路径继承**：根文件（`IsRootFile`）保持用户视角路径不变
 
-### 4.6 软删除时的重命名
+### 4.10 软删除时的重命名
 
 [SoftDelete](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/inventory/file.go#L409-L421) 将文件重命名为随机 UUID，同时清除父级关联：
 
@@ -458,7 +798,7 @@ fc.UpsertMetadata(ctx, target.Model, map[string]string{
 }, nil)
 ```
 
-### 4.7 从回收站恢复时的重命名
+### 4.11 从回收站恢复时的重命名
 
 [moveFiles](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L967-L1007) 中，当文件从回收站移出时：
 
@@ -480,7 +820,7 @@ func (f *File) DisplayName() string {
 
 回收站中的文件实际名称是 UUID，但 `DisplayName` 从元数据中恢复原始名称。
 
-### 4.8 全文索引一致性
+### 4.12 全文索引一致性
 
 重命名后如果文件有全文索引标记（`sys:fulltext_index`），会生成 `IndexDiff` 用于更新搜索引擎（[manage.go#L232-L247](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L232-L247)）：
 
@@ -499,7 +839,7 @@ if _, ok := originalMetadata[FullTextIndexKey]; ok {
 }
 ```
 
-### 4.9 复制时的元数据排除
+### 4.13 复制时的元数据排除
 
 [copyFiles](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L867-L965) 中，复制操作会排除全文索引元数据：
 
