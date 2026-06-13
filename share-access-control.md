@@ -608,7 +608,7 @@ func NewShareUri(id, password string) string {
 
 ---
 
-### 9.3 失效判断（IsValidShare）和 过期判断（IsShareExpired）的区别
+### 9.3 失效判断（IsValidShare）和 过期判断（IsShareExpired）的区别，以及 Expired 标记的实际可达性
 
 两个函数的包含关系：`IsValidShare = IsShareExpired + 所有者状态检查 + 源文件状态检查`
 
@@ -617,7 +617,7 @@ func NewShareUri(id, password string) string {
 #### 函数定义对比
 
 ```go
-// IsShareExpired：仅检查分享自身的两个过期属性
+// IsShareExpired：仅检查分享自身的两个过期属性（纯数据判断，不涉及外部关联）
 func IsShareExpired(share *ent.Share) error {
     if (share.Expires != nil && share.Expires.Before(time.Now())) ||
         (share.RemainDownloads != nil && *share.RemainDownloads <= 0) {
@@ -626,18 +626,18 @@ func IsShareExpired(share *ent.Share) error {
     return nil
 }
 
-// IsValidShare：全面检查分享是否可访问
+// IsValidShare：全面检查分享是否可访问（含外部关联对象）
 func IsValidShare(share *ent.Share) error {
-    // 步骤 1：先检查过期
+    // 步骤 1：先检查数据层面过期
     if err := IsShareExpired(share); err != nil {
         return err                  // ErrShareLinkExpired
     }
-    // 步骤 2：检查所有者状态
+    // 步骤 2：检查关联所有者状态
     owner, err := share.Edges.UserOrErr()
     if err != nil || owner.Status != user.StatusActive {
         return ErrOwnerInactive      // "owner is inactive"
     }
-    // 步骤 3：检查源文件有效性
+    // 步骤 3：检查关联源文件状态
     file, err := share.Edges.FileOrErr()
     if err != nil || file.FileChildren == 0 || file.OwnerID != owner.ID {
         return ErrSourceFileInvalid  // "source file is deleted"
@@ -646,22 +646,123 @@ func IsValidShare(share *ent.Share) error {
 }
 ```
 
-#### 不同场景的使用差异
+#### 关键代码路径：单个分享详情中 `Expired` 字段实际不可达
 
-| 调用位置 | 使用的函数 | 后果 |
-|---------|----------|------|
-| `ShareInfoService.Get()` 获取单个分享 | `IsValidShare` | 任何原因导致分享无效，直接返回 404 `"Share link expired"` |
-| `share_navigator.Root()` 文件系统导航 | `IsValidShare` | 任何原因导致分享无效，返回 `ErrShareNotFound` |
-| `BuildShare()` 构建响应的 `Expired` 字段 | `IsShareExpired \|\| expired` | 仅用于前端展示"已过期"标识，不会阻断访问 |
-| `BuildListShareResponse()` 列表中的 `expired` 参数 | `IsValidShare`（结果传入 BuildShare 的 expired 参数） | 列表中分享的过期标识基于完整有效性 |
+在 `BuildShare()` 中，`Expired` 字段定义为：
+```go
+Expired: inventory.IsShareExpired(s) != nil || expired
+```
+
+但顺着单个分享详情接口的代码路径 [service/share/visit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/visit.go#L60-L112) 追溯：
+
+```
+GET /share/:id （单个分享详情）
+    │
+    ├─ 第 67 行：shareClient.GetByID() → 查到 share 记录
+    │
+    ├─ 第 75 行：IsValidShare(share)
+    │   │
+    │   └─ 内部先调用 IsShareExpired()
+    │       ├─ 如果 IsShareExpired 返回错误（时间过期或下载次数耗尽）
+    │       │   └─ IsValidShare 立即返回 ErrShareLinkExpired
+    │       │       └─ 第 76 行：return CodeNotFound, "Share link expired"
+    │       │           ⚠️ BuildShare() 根本不会被调用！接口直接返回 404
+    │       │
+    │       └─ 如果 IsShareExpired 通过（返回 nil）
+    │           └─ 继续检查所有者状态、源文件状态...
+    │
+    ├─ 第 90 行：BuildShare(share, ..., unlocked, expired=false)
+    │   │
+    │   └─ 此时 IsShareExpired(s) 已经为 nil（否则走不到这里）
+    │      expired 参数为 false
+    │      → Expired = false || false = false  恒为 false
+    │
+    └─ 🔚 结论：在单个分享详情接口的 200 成功响应中，
+               Expired 字段永远是 false！没有任何情况能让它为 true。
+```
+
+#### 不同场景的使用差异（修正版）
+
+| 场景 | 判定函数 | 结果 | 是否能让前端看到 `Expired=true` |
+|------|---------|------|------------------------------|
+| **单个分享详情 GET /share/:id** | `IsValidShare`（拦截式） | 失败 → 直接 404 | ❌ 不可达。能成功返回时 Expired 恒为 false |
+| **分享文件系统导航 share_navigator.Root()** | `IsValidShare`（拦截式） | 失败 → `ErrShareNotFound` | ❌ 同上 |
+| **我的分享列表 / 用户主页分享列表** | `IsValidShare`（仅打标） | 结果作为 `expired` 参数传入 BuildShare | ✅ 可达。列表中过期/失效分享仍会展示，只是 Expired=true |
+| **分享列表内部 `BuildShare` 计算** | `IsShareExpired \|\| expired` | 作为最终展示值 | ✅ 列表场景中两个条件任一成立即为 true |
+
+#### 深度分析：为什么 Expired 字段在成功响应中几乎不会变为 true
+
+全局搜索 `explorer.BuildShare(` 的所有调用点，仅有 **3 处**：
+
+| # | 调用位置 | `expired` 参数值 | 说明 |
+|---|---------|-----------------|------|
+| 1 | [service/share/visit.go:90-91](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/visit.go#L90-L91) | `false` 硬编码 | 单个分享详情接口 |
+| 2 | [service/share/response.go:39-40](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/response.go#L39-L40) | 传入的 `expired` 变量（来自 `IsValidShare` 结果） | 我的分享列表 |
+| 3 | [service/share/response.go:39-40](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/response.go#L39-L40) | 传入的 `expired` 变量（来自 `IsValidShare` 结果） | 用户主页分享列表 |
+
+**关键代码路径证明（单分享详情接口）**：
+
+```
+ShareInfoService.Get()  [visit.go:60-112]
+  │
+  ├─ 67: share, err := shareClient.GetByID(ctx, ...)  → 数据库查到 share 记录
+  │    ↓
+  ├─ 75: if err := inventory.IsValidShare(share); err != nil
+  │    │
+  │    └─ IsValidShare() 内部  [inventory/share.go:289-306]
+  │        │
+  │        ├─ if err := IsShareExpired(share); err != nil
+  │        │   └─ 如果 IsShareExpired 返回错误
+  │        │      └─ IsValidShare 立即 return err
+  │        │          ↓
+  │        └─ 76: return CodeNotFound, "Share link expired"
+  │            ⚠️  BuildShare() 根本不会被调用！接口直接返回 404
+  │
+  └─ 90: 能走到这里 → IsShareExpired() 已为 nil（否则已经 404 了）
+       BuildShare(share, ..., unlocked, false)
+         │
+         └─ Expired = (IsShareExpired(s) != nil) || false
+                = (nil != nil) || false
+                = false
+```
+
+**唯一可达路径：分享列表场景**：
+```
+BuildListShareResponse()  [response.go:21-36]
+  │
+  └─ for _, share := range res.Shares
+         │
+         ├─ expired := inventory.IsValidShare(share) != nil  → 不拦截，只打标
+         │    ↓ 即使 true 也继续执行
+         └─ BuildShare(share, ..., unlocked, expired)
+                ↓
+            Expired = (IsShareExpired(s) != nil) || expired
+                    = 可能为 true！
+```
+
+**设计意图**：
+- 单分享详情接口：失效的分享直接 404，不需要 `Expired` 标记
+- 分享列表接口：失效的分享也要展示给用户（只是标记为灰色），所以需要 `Expired` 字段
+- 这解释了为什么 `BuildShare` 同时接收 `IsShareExpired(s)` 和 `expired` 参数两个来源 — 列表场景下即使分享本身没过期（`IsShareExpired`=nil），如果所有者被封了（`IsValidShare` 失败），也应该标记为 `Expired=true`
+
+列表场景的调用链：[service/share/response.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/response.go#L21-L36)
+```go
+func BuildListShareResponse(res *inventory.ListShareResult, ...) *ListShareResponse {
+    for _, share := range res.Shares {
+        // 对每个分享调用 IsValidShare，结果转换为 bool 作为 expired 参数
+        expired := inventory.IsValidShare(share) != nil
+        // 不会因为 expired=true 就跳过，仍然加入返回列表
+        infos = append(infos, *explorer.BuildShare(share, ..., unlocked, expired))
+    }
+}
+```
 
 #### 设计意图分析
 
-1. **访问拦截用 IsValidShare**：获取分享内容、浏览文件系统等真正需要访问分享资源的操作，必须通过完整校验 —— 源文件被删、所有者被封号都应该阻断访问
+1. **访问拦截用 IsValidShare（Fail-Closed）**：获取分享内容、浏览文件系统等真正需要访问资源的操作，必须通过完整校验 —— 源文件被删、所有者被封号都应该阻断访问。时间过期只是最表层的原因，其他失效原因同样不可访问。
 
-2. **展示标识分层处理**：
-   - `Expired` 字段在 `BuildShare()` 中同时看 `IsShareExpired()` 和传入的 `expired` 参数
-   - 在单分享查询时（`ShareInfoService.Get()`）传入 `expired=false`，所以 `Expired` 仅反映时间/下载次数耗尽
-   - 在列表查询时（`BuildListShareResponse()`）传入 `IsValidShare()` 的结果，所以列表中的 `Expired` 包含所有失效原因
+2. **列表打标用 IsValidShare（Fail-Open 展示）**：在"我的分享"列表中，即使分享失效也要展示给用户看，只是标记为已过期。否则用户会疑惑"我创建的分享怎么不见了？"
 
-3. **错误码统一但语义不同**：`ShareInfoService.Get()` 中 `IsValidShare` 失败后统一返回 `"Share link expired"`（第 76 行），无论实际是时间过期、所有者被封还是源文件被删，对外都表现为"链接过期"，避免泄露内部状态信息
+3. **Expired 字段是展示专用**：它不承担访问控制功能（那是 `IsValidShare` 的事），只是告诉前端"这个分享在列表中是灰色失效状态"。单分享详情接口不需要这个标记，因为失效的分享在单查询时已被 404 拦截。
+
+4. **错误码统一但语义不同**：`ShareInfoService.Get()` 中 `IsValidShare` 失败后统一返回 `"Share link expired"`（第 76 行），无论实际是时间过期、所有者被封还是源文件被删，对外都表现为"链接过期"，避免泄露「所有者被封号」「源文件被删除」等内部状态信息，减少信息泄露面。
