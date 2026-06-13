@@ -200,83 +200,127 @@ URL 生成入口：[EntitySource.Url()](file:///d:/fz/0601-1/solo-dogfeeding/cod
 
 ## 四、出错时的返回与默认图片
 
-### 4.1 缩略图 API 的错误响应
+### 4.1 FileThumbService.Get() 内部的三个错误位点
 
-当 `GET /api/v3/file/thumb?uri=xxx` 请求失败时，后端始终返回 HTTP 200，在 JSON body 中用 `code` 字段区分成功与失败：
-
-**成功响应**：
-```json
-{"code":0,"data":{"url":"https://...","expires":"2026-06-13T10:00:00Z"}}
-```
-
-**失败响应**：
-```json
-{"code":40077,"msg":"Entity not exist","error":"failed to get thumbnail: ..."}
-```
-
-错误码来源于 [serializer.CodeEntityNotExist](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/serializer/error.go#L235) = 40077，由 `fs.ErrEntityNotExist` 产生。此错误在以下场景触发：
-- Manager 层预检发现 `ThumbDisabledKey`
-- Manager 层所有降级路径均不可用（第五层兜底）
-- 缩略图实体不存在且驱动不支持
-
-控制器层的处理逻辑：
-[controllers.Thumb()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/routers/controllers/file.go#L147-L157)
+[FileThumbService.Get()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/service/explorer/file.go#L497-L524) 内部有三个独立的错误触发点，每个错误被不同方式包装和传递：
 
 ```go
-func Thumb(c *gin.Context) {
-    res, err := service.Get(c)
+func (s *FileThumbService) Get(c *gin.Context) (*FileThumbResponse, error) {
+    // ...
+    uri, err := fs.NewUriFromString(s.Uri)       // ① 位点 A: URI 解析
     if err != nil {
-        c.JSON(200, serializer.Err(c, err))  // 错误 → JSON 错误响应
-        c.Abort()
-        return
+        return nil, serializer.NewError(serializer.CodeParamErr, "unknown uri", err)
     }
-    c.JSON(200, serializer.Response{Data: res})  // 成功 → JSON URL 响应
+    thumb, err := m.Thumbnail(c, uri)             // ② 位点 B: Manager 决策层
+    if err != nil {
+        return nil, fmt.Errorf("failed to get thumbnail: %w", err)
+    }
+    thumbUrl, err := thumb.Url(c, ...)            // ③ 位点 C: EntitySource 生成 URL
+    if err != nil {
+        return nil, fmt.Errorf("failed to get thumbnail url: %w", err)
+    }
+    // ...
 }
 ```
 
-### 4.2 前端无服务端默认图片
+### 4.2 错误响应的序列化机制
 
-**Cloudreve 后端不提供任何默认的缩略图占位图**。当缩略图 API 返回错误时：
+控制器层统一调用 `serializer.Err(c, err)`，其内部实现为：
 
-- 前端收到 `code != 0` 的 JSON 响应，知道缩略图不可用
-- 前端自行决定展示方式（通常使用本地的文件类型图标作为占位）
-- 不存在从后端加载 fallback 图片的机制
+[serializer.ErrWithDetails()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/serializer/error.go#L341-L375)
 
-这与社交分享场景形成对比——社交分享有专门的服务端兜底图片。
+```go
+func ErrWithDetails(c context.Context, errCode int, msg string, err error) Response {
+    res := Response{Code: errCode, Msg: msg, CorrelationID: ...}
+    var appError AppError
+    if errors.As(err, &appError) {       // ← 关键：沿 %w 包装链递归查找 AppError
+        res.Code = appError.ErrCode()    // ErrCode() 继续递归解包嵌套 AppError
+        err = appError.RawError
+        res.Msg = appError.Msg
+    }
+    if err != nil && gin.Mode() != gin.ReleaseMode {
+        res.Error = err.Error()          // 非生产环境暴露完整错误文本
+    }
+    return res
+}
+```
 
-### 4.3 内部代理路径中的错误
+`errors.As(err, &appError)` 会沿 `fmt.Errorf("%w", ...)` 的包装链一直深入，直到找到最内层的 `AppError`。如果整条链中不存在 `AppError`，则保留初始传入的 `CodeNotSet = -1` 和空 `Msg`。
 
-当浏览器通过内部代理 URL 加载缩略图图片数据时，错误以 HTTP 状态码直接返回：
+基于此机制，三个错误位点分别产生以下几类响应：
+
+### 4.3 错误类型分类表
+
+| 错误来源 | 触发场景 | 错误包装链 | 最内层是否 AppError | 最终 code | 最终 msg | 生产环境 error 字段 |
+|---------|---------|-----------|-------------------|-----------|----------|-------------------|
+| **位点 A** URI 解析 | URI 格式非法 | `NewError(CodeParamErr, "unknown uri", err)` | 是 | **40001** | `"unknown uri"` | 空 |
+| **位点 B** Manager 预检 + 决策兜底 | ThumbDisabledKey 命中 / 所有降级路径均不可用 / 目录无主实体 | `"failed to get thumbnail: %w"` → `fs.ErrEntityNotExist` → `NewError(40077, "Entity not exist")` | 是 | **40077** | `"Entity not exist"` | 空 |
+| **位点 B** Manager 中间步骤失败 | 缩略图实体已关联但 EntitySource 创建失败 / 队列任务执行失败 | `"failed to get thumbnail: %w"` → `"failed to get entity source: %w"` / `"failed to execute thumb task: %w"` → 可能是 DB 错误 / 上下文取消等 | 可能是 | 取决于内层 | 取决于内层 | 空 |
+| **位点 C** 存储直链签名失败（S3/OSS/COS 等） | 签名密钥异常 / 临时凭证过期 | `"failed to get thumbnail url: %w"` → 各 SDK 原生错误 | 否 | **-1** (CodeNotSet) | **空字符串** | 空 |
+| **位点 C** OneDrive Graph API 失败（※重要） | 不支持的文件格式 / Token 过期 / 网络异常 | `"failed to get thumbnail url: %w"` → `"thumb not supported in OneDrive: %w"` / 其他 Graph 错误 | 否 | **-1** (CodeNotSet) | **空字符串** | 空 |
+| **位点 C** 内部代理 URL 构建失败 | 签名密钥缺失 / HashID 编码失败 | `"failed to get thumbnail url: %w"` → 底层错误 | 可能是 | 取决于内层 | 取决于内层 | 空 |
+
+### 4.4 OneDrive 错误响应的隐蔽性
+
+这是最容易误解的一类错误：OneDrive 的缩略图错误全部发生在 **位点 C**，即在 Manager 决策之后的 URL 生成阶段。
+
+代码路径：
+- Manager 层判定 OneDrive 具备原生能力，返回 EntitySource ✓
+- 调用 `thumb.Url()` → `handler.Thumb()` → `client.GetThumbURL()` 发起 Graph API 请求 ✗
+- [onedrive.go#L139-L150](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/driver/onedrive/onedrive.go#L139-L150) 中对错误的包装使用 `fmt.Errorf("thumb not supported in OneDrive: %w", err)`
+
+由于整个包装链中**没有任何 AppError**，最终序列化结果在生产环境为：
+
+```json
+{
+  "code": -1,
+  "msg": "",
+  "correlation_id": "xxxxx"
+}
+```
+
+前端看到 `code = -1`，只能判定为"出错了"，但无法区分具体是 OneDrive 不支持该文件、还是网络问题、亦或是 Token 过期。`msg` 字段为空字符串，`error` 字段在生产环境被隐藏。
+
+**调试提示**：在 debug 模式（`GIN_MODE=debug`）下，`error` 字段会暴露完整错误链，例如：`"failed to get thumbnail url: thumb not supported in OneDrive: large thumbnail size not found"`。
+
+### 4.5 成功响应格式
+
+```json
+{
+  "code": 0,
+  "data": {
+    "url": "https://xxx.oss-cn-hangzhou.aliyuncs.com/path/to/thumb.jpg?x-oss-process=image%2Fresize...&OSSAccessKeyId=...&Expires=...&Signature=...",
+    "expires": "2026-06-13T10:05:00Z"
+  }
+}
+```
+
+### 4.6 前端无服务端默认图片
+
+**Cloudreve 后端不提供任何默认的缩略图占位图 URL**。当缩略图 API 返回 `code != 0` 时：
+
+- 前端仅能通过 `code` 字段判定失败，无 fallback URL 可用
+- 前端自行决定展示方式（通常使用本地打包的文件类型 SVG 图标作为占位）
+- 不存在让 `<img>` 从后端加载一张"占位图"的机制
+
+这与社交分享场景不同——社交分享在服务端有 PWA 图标作为兜底（见第八章）。
+
+### 4.7 内部代理路径中的 HTTP 状态码错误
+
+当浏览器通过内部代理 URL（`/api/v3/file/content/{id}?thumb`）实际加载图片二进制数据时，错误以原始 HTTP 状态码直接返回：
 
 [EntitySource.Serve()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/manager/entitysource/entitysource.go#L270-L384)
 
 | 场景 | HTTP 状态码 | 响应体 |
 |------|-----------|--------|
-| 本地实体数据不存在 | 404 | `"Entity data does not exist."` |
-| 非本地文件 URL 生成失败 | 500 | 错误信息字符串 |
-| 非本地文件 URL 解析失败 | 500 | 错误信息字符串 |
-| 反向代理到存储端失败 | 502 | `"[Cloudreve] Bad Gateway"` |
-| 文件 Seek 失败 | 500 | `"seeker can't seek"` |
+| 本地实体底层数据不存在（文件被删但 DB 记录还在） | 404 | `"Entity data does not exist."` |
+| 远程文件签名 URL 生成失败 | 500 | 错误信息字符串（取决于运行环境） |
+| 远程文件签名 URL 格式解析失败 | 500 | 错误信息字符串 |
+| 反向代理到存储端时连接失败 / 超时 | 502 | `"[Cloudreve] Bad Gateway"` |
+| 本地文件 Seek 失败（Range 请求异常） | 500 | `"seeker can't seek"` |
+| 签名校验不通过（URL 被篡改 / 过期） | 401 | `{"code":401, "msg":"signature invalid"}` |
 
-浏览器收到这些 HTTP 错误后，`<img>` 标签显示为破碎图标，前端可监听 `onerror` 事件做占位处理。
-
-### 4.4 社交分享的默认图片
-
-社交分享是唯一存在服务端默认图片的场景。当缩略图获取失败时，降级到 PWA 应用图标：
-
-[renderShareOGPage()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/middleware/share_preview.go#L129-L179)
-
-```
-优先使用 pwa.LargeIcon（PWA 大图标）
-    ↓ 不存在
-使用 pwa.MediumIcon（PWA 中等图标）
-    ↓ 缩略图获取成功
-覆盖为文件缩略图 URL
-    ↓ 缩略图获取失败
-继续使用 PWA 图标（静默降级，不报错）
-```
-
-默认图片的 URL 由 `resolveURL(base, pwa.LargeIcon)` 生成，其中 `base` 是站点 URL，`pwa.LargeIcon` 是管理后台配置的 PWA 图标路径。如果路径是相对路径，会基于站点 URL 补全为绝对 URL。
+浏览器收到这些非 2xx 状态码后，`<img>` 标签显示为破碎图标，前端可监听 `onerror` 事件切换到本地占位图。
 
 ---
 
