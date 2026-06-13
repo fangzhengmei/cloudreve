@@ -8,6 +8,9 @@
 - [2. 协议鉴权机制](#2-协议鉴权机制)
 - [3. 文件锁实现](#3-文件锁实现)
 - [4. 文件回写路径](#4-文件回写路径)
+  - [4.6 历史版本读取与回写一致性](#46-历史版本读取与回写一致性)
+  - [4.6.4 写入成功后的会话 Version 含义](#464-写入成功后的会话-version-含义)
+  - [4.6.5 入口处操作类型的自动切换逻辑](#465-入口处操作类型的自动切换逻辑)
 - [5. 编辑冲突处理](#5-编辑冲突处理)
 - [6. 关键代码文件索引](#6-关键代码文件索引)
 
@@ -606,7 +609,163 @@ canEdit := file.PrimaryEntityID() == targetEntity.ID()  // 必须是最新版本
 3. 回写会**覆盖最新版本**，而不是修改历史版本
 4. 用户编辑的是历史版本的内容，但保存后最新版本被覆盖，导致"打开历史版本编辑后内容不一致"
 
-#### 4.6.3 查看/编辑操作类型是否记录在会话中
+#### 4.6.4 写入成功后的会话 Version 含义
+
+> **⚠️ 关键发现**：写入成功后，会话中的 `Version` 字段**不会被更新**，后续读取会**继续使用旧版本标识**。
+
+**核心代码**：
+- 会话创建时写入 Version：[manager/viewer.go L70](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/filemanager/manager/viewer.go#L70)
+- KV 存储会话：[manager/viewer.go L74](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/filemanager/manager/viewer.go#L74)
+- 中间件读取会话：[middleware/wopi.go L44-L52](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/middleware/wopi.go#L44-L52)
+
+**分析过程**：
+
+```go
+// 1. 会话创建时，Version 被写入 KV 存储（仅此一次）
+sessionCache := &ViewerSessionCache{
+    // ...
+    Version:  version,  // 保存用户请求的版本（可能是历史版本）
+    Token:    fmt.Sprintf("%s.%s", sessionID, token),
+}
+ttl := m.settings.ViewerSessionTTL(ctx)
+if err := m.kv.Set(ViewerSessionCachePrefix+sessionID, *sessionCache, ttl); err != nil {
+    return nil, err
+}
+
+// 2. 搜索整个代码库，没有找到任何 "ViewerSessionCachePrefix + sessionID" 再次 Set 的调用
+//    除了创建时的 Set，没有其他地方更新 KV 存储中的会话
+
+// 3. PutContent 写入成功后，不更新会话 Version
+// PutContent 流程：
+//   - fileUri := viewerSession.Uri  ← 使用文件 URI
+//   - subService := FileUpdateService{Uri: fileUri}  ← 不更新 Version
+//   - res, err := subService.PutContent(c, lockSession)  ← 执行写入
+//   - 成功后返回 res.PrimaryEntity（新版本ID）到响应头
+//   - ❌ 但会话缓存中的 Version 字段没有任何更新！
+
+// 4. 中间件每次请求都直接从 KV 读取原始会话
+sessionRaw, exist := store.Get(manager.ViewerSessionCachePrefix + accessToken[0])
+session := sessionRaw.(manager.ViewerSessionCache)  // ← 读取的是创建时的 Version
+util.WithValue(c, manager.ViewerSessionCacheCtx{}, &session)
+```
+
+**完整时序分析**：
+
+```
+时间轴：
+T1: 创建会话
+    → 用户请求 version=V1（历史版本）
+    → 会话缓存 Version = V1 写入 KV
+    → 返回 access_token
+
+T2: 第一次 GetFile（读取内容）
+    → 从 KV 读取会话，Version = V1
+    → FindDesiredEntity(file, "V1") → 找到历史版本实体
+    → 返回历史版本 V1 的内容
+
+T3: CheckFileInfo（检查权限）
+    → 从 KV 读取会话，Version = V1
+    → FindDesiredEntity(file, "V1") → 找到历史版本实体
+    → canEdit = PrimaryEntityID(V2) == targetEntityID(V1) → false
+    → 客户端收到 ReadOnly=true 提示
+
+T4: PutContent（写入，假设客户端绕过只读限制）
+    → 从 KV 读取会话，Version = V1
+    → 使用 viewerSession.Uri（文件 URI），不区分版本
+    → 创建新实体 V3（最新版本）
+    → 返回 res.PrimaryEntity = V3 到 X-WOPI-ItemVersion 头部
+    → ❌ 会话缓存 Version 仍然是 V1！
+
+T5: 第二次 GetFile（后续读取）
+    → 从 KV 读取会话，Version = V1（仍然是旧版本！）
+    → FindDesiredEntity(file, "V1") → 找到旧历史版本实体
+    → ⚠️ 返回的是 V1 的内容，不是刚写入的 V3！
+
+T6: 第二次 CheckFileInfo
+    → 从 KV 读取会话，Version = V1
+    → canEdit = PrimaryEntityID(V3) == targetEntityID(V1) → false
+    → 继续显示只读
+```
+
+**问题总结**：
+
+| 时间点 | 会话中的 Version | 实际最新版本 | 读取到的版本 | 一致性状态 |
+|-------|-----------------|-------------|-------------|-----------|
+| T1 创建会话 | V1（历史版本） | V2 | — | 创建时锁定 |
+| T2 GetFile | V1 | V2 | V1 | ✅ 正确读取历史 |
+| T4 PutContent | V1（未更新） | **V3（新写入）** | — | ⚠️ 写入最新，Version 不变 |
+| T5 GetFile | **V1（旧！）** | V3 | V1（旧！） | ❌ 读取到旧版本，不是刚写入的 V3 |
+
+**根本原因**：
+- 会话 Version 仅在创建时写入 KV 一次，之后永不更新
+- PutContent 成功后没有调用 `kv.Set` 更新会话缓存
+- 每次请求从 KV 读取的始终是创建时的原始 Version
+- WOPI 客户端可能依赖 `X-WOPI-ItemVersion` 响应头来更新本地版本，但服务端会话不会同步
+
+**潜在影响**：
+1. 写入后再次读取，会错误地返回最初打开时的历史版本内容
+2. 用户误以为保存失败或内容丢失
+3. 与 WOPI 协议预期不一致（写入后版本应推进）
+
+---
+
+#### 4.6.3 操作类型的性质：偏好设置与自动降级
+
+> **⚠️ 关键发现**：`PreferredAction` 仅是**偏好设置**，当遇到功能限制时会**自动降级**到其他可用模式。
+
+**核心代码**：
+- 请求参数定义：[viewer.go L373](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/viewer.go#L373)
+- 自动降级逻辑：[wopi.go L73-L78](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/wopi/wopi.go#L73-L78)
+- WOPI Actions 映射：[discovery.go L47-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/wopi/discovery.go#L47-L53)
+
+**分析**：
+
+```go
+// 1. 参数名是 PreferredAction（首选动作），暗示只是偏好
+type CreateViewerSessionService struct {
+    // ...
+    PreferredAction types.ViewerAction `json:"preferred_action" form:"preferred_action" binding:"required"`
+    // ↑ 命名为 Preferred 表示"首选"，不是"必须"
+}
+
+// 2. GenerateWopiSrc 中存在自动降级逻辑
+func GenerateWopiSrc(ctx context.Context, action types.ViewerAction, viewer *types.Viewer, viewerSession *manager.ViewerSession) (*url.URL, error) {
+    // 获取该文件扩展名支持的所有 WOPI 操作
+    availableActions, ok := viewer.WopiActions[viewerSession.File.Ext()]
+    if !ok {
+        return nil, ErrActionNotSupported
+    }
+
+    // 降级顺序：首选 action → view → edit
+    fallbackOrder := []types.ViewerAction{action, types.ViewerActionView, types.ViewerActionEdit}
+    for _, a := range fallbackOrder {
+        if src, ok = availableActions[a]; ok {
+            break  // 找到第一个可用的就用它
+        }
+    }
+    // ...
+}
+```
+
+**自动降级规则**：
+
+| 首选操作 | 降级顺序 | 说明 |
+|---------|---------|------|
+| `edit`（编辑） | edit → view → edit | 没有编辑模式时降级到预览 |
+| `view`（预览） | view → edit | 没有预览模式时降级到编辑 |
+
+**降级发生的场景**：
+1. **WOPI 服务器不支持该操作**：某些文件格式可能只有预览（`embedview`/`view`）而没有编辑（`edit`）的 URL
+2. **discovery.xml 中未定义对应操作**：WOPI 发现文档中某些扩展名只有部分操作
+3. **扩展名不在支持列表中**：完全不支持的扩展名直接返回 `ErrActionNotSupported`
+
+**关键特性**：
+- 降级只发生在**链接生成阶段**（会话创建时），不是运行时动态切换
+- 降级后，WOPI 客户端以降级后的模式启动（如请求 edit 但实际进入 view 模式）
+- 降级结果只体现在 WOPI URL 中，**不记录到会话**
+- 服务端后续无法通过会话判断实际运行的是查看还是编辑模式
+
+#### 4.6.4 查看/编辑操作类型未记录在会话中
 
 > **⚠️ 关键发现**：操作类型（查看/编辑）**只在链接生成阶段使用**，没有记录在会话状态中。
 
@@ -618,16 +777,7 @@ canEdit := file.PrimaryEntityID() == targetEntity.ID()  // 必须是最新版本
 **分析**：
 
 ```go
-// 1. 请求参数中有 PreferredAction 字段
-type CreateViewerSessionService struct {
-    Uri             string               `json:"uri" form:"uri" binding:"required"`
-    Version         string               `json:"version" form:"version"`
-    ViewerID        string               `json:"viewer_id" form:"viewer_id" binding:"required"`
-    PreferredAction types.ViewerAction   `json:"preferred_action" form:"preferred_action" binding:"required"`
-    // ↑ 有这个字段，但只在生成链接时使用
-}
-
-// 2. 会话缓存中没有 Action 字段
+// 1. 会话缓存中没有 Action 字段
 type ViewerSessionCache struct {
     ID       string
     Uri      string
@@ -639,28 +789,15 @@ type ViewerSessionCache struct {
     // ❌ 没有 Action 字段！
 }
 
-// 3. 调用 CreateViewerSession 时没有传递 action
+// 2. 调用 CreateViewerSession 时没有传递 action
 // viewer.go L409
 viewerSession, err := m.CreateViewerSession(c, uri, s.Version, targetViewer)
 // ↑ 只传了 version，没有传 s.PreferredAction
 
-// 4. PreferredAction 只在生成 WOPI 链接时使用
+// 3. PreferredAction 只在生成 WOPI 链接时使用
 // viewer.go L417
 wopiSrc, err := wopi.GenerateWopiSrc(c, s.PreferredAction, targetViewer, viewerSession)
 // ↑ 用于选择 WOPI 服务器的 URL 模板（embedview 或 edit）
-
-// 5. GenerateWopiSrc 中 action 的用途
-func GenerateWopiSrc(ctx context.Context, action types.ViewerAction, ...) (*url.URL, error) {
-    // 根据 action 选择可用的 WOPI 操作 URL
-    availableActions, ok := viewer.WopiActions[viewerSession.File.Ext()]
-    fallbackOrder := []types.ViewerAction{action, types.ViewerActionView, types.ViewerActionEdit}
-    for _, a := range fallbackOrder {
-        if src, ok = availableActions[a]; ok {
-            break
-        }
-    }
-    // 生成 WOPI 客户端 URL，不会修改会话
-}
 ```
 
 **操作类型的生命周期**：
@@ -671,7 +808,7 @@ CreateViewerSessionService 接收参数
     ↓
 m.CreateViewerSession() → 创建会话（不保存 action）
     ↓
-wopi.GenerateWopiSrc(preferred_action, ...) → 选择 WOPI URL 模板
+wopi.GenerateWopiSrc(preferred_action, ...) → 选择 WOPI URL 模板（可能自动降级）
     ↓
 返回 WOPI src URL 给前端
     ↓
