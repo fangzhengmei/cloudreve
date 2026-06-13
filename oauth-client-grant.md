@@ -6,11 +6,15 @@
 2. [Grant 生命周期](#2-grant-生命周期)
    - [2.2.5 Grant 在授权确认到换 Token 之间的状态变化](#225-grant-在授权确认到换-token-之间的状态变化补充)
    - [2.2.6 刷新 grant.last_used_at 的所有操作](#226-哪些操作会刷新-grantlast_used_at代码对照)
+   - [2.4 Grant 生命周期总结](#24-grant-生命周期总结)
 3. [Scope 边界](#3-scope-边界)
-   - [3.5 Scope 收缩后的实际生效边界](#35-scope-收缩后的实际生效边界补充)
-   - [3.6 Access Token vs Refresh Token 校验路径逐行对照](#36-access-token-vs-refresh-token代码级校验路径逐行对照)
+   - [3.2 Scope 校验机制](#32-scope-校验机制)
+   - [3.5 Scope 边界总结](#35-scope-边界总结)
+   - [3.6 鉴权校验的实际走法](#36-鉴权校验的实际走法access-token-与-refresh-token-代码路径对照)
 4. [撤销风险分析](#4-撤销风险分析)
-   - [4.2.6 客户端 scope 收缩后遗留访问窗口的完整代码路径](#426-客户端-scope-收缩后遗留访问窗口的完整代码路径)
+   - [4.1 撤销路径概览](#41-撤销路径概览)
+   - [4.2.6 Client Scope 收缩后为什么不会立刻挡住旧权限](#426-client-scope-收缩后为什么不会立刻挡住旧权限三层原因拆解)
+   - [4.5 改进建议](#45-改进建议基于代码分析)
 
 ---
 
@@ -501,11 +505,23 @@ for _, uri := range app.RedirectUris {
 
 ### 4.5 改进建议（基于代码分析）
 
-1. **缩短 Access Token TTL**：降低撤销窗口期
-2. **Access Token 黑名单**：对高安全级别操作，可考虑引入短期访问令牌撤销列表
-3. **Grant 删除时级联撤销根令牌**：删除 grant 时同时将该用户-客户端对应的所有 root_token_id 加入撤销列表
-4. **强化 Public Client 检测**：对移动端/桌面端客户端强制要求 PKCE
-5. **审计日志**：记录 grant 创建、撤销、token 刷新等安全事件
+基于以上精确的代码分析，按优先级排序：
+
+1. **[高] Refresh 时增加 `claims.Scopes ⊆ client.Scopes` 校验**：[jwt.go L173-L176](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/pkg/auth/jwt.go#L173-L176) 已查出 `client` 对象且 `client.Scopes` 可用，只需加一行 `ValidateScopes(claims.Scopes, client.Scopes)` 即可堵住 client scope 收缩不生效的漏洞。
+
+2. **[高] Refresh 签发新 token 时用 `grant.Scopes` 裁剪而非原样复用 `claims.Scopes`**：[jwt.go L188-L194](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/pkg/auth/jwt.go#L188-L194) 中 `Scopes: claims.Scopes` 应改为 `Scopes: client.Edges.Grants[0].Scopes`（取 grant 和 claims 的交集），确保 scope 只降不升。
+
+3. **[高] 管理员收缩 client.scopes 时级联更新关联 grants**：在 [admin oauth_client.go](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/service/admin/oauth_client.go) 的更新逻辑中，当 `client.Scopes` 缩小时，批量更新所有关联 grant 的 scopes 为 `grant.Scopes ∩ newClient.Scopes`。
+
+4. **[中] 缩短 Access Token TTL**：在 OAuth 场景下将 Access Token TTL 控制在 15 分钟以内，缩小撤销后的安全盲区。
+
+5. **[中] 删除 Grant/禁用 Client 时级联撤销 root_token_id**：当前仅删除数据库记录，可考虑同时写入 KV 撤销列表，让 Access Token 也能更快失效。
+
+6. **[低] 对高危 API 增加 Access Token 级撤销检查**：对文件删除等高风险操作，可在中间件中增加对 root_token_id 的 KV 撤销检查。
+
+7. **[低] 强制 Public Client 使用 PKCE**：Desktop 和 iOS 的 secret 硬编码无保密性，应强制 PKCE。
+
+8. **[低] 审计日志**：记录 grant 创建/撤销、token 交换/刷新失败、client 配置变更等安全事件。
 
 ---
 
