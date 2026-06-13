@@ -140,13 +140,34 @@ func (m *manager) GetStorageDriver(ctx context.Context, policy *ent.StoragePolic
 
 > **设计要点**：对象存储驱动需要 MIME 探测器在上传时推断 Content-Type；OneDrive 需要凭证管理器处理 OAuth 刷新。
 
-### 2.2 从节点策略类型转换 CastStoragePolicyOnSlave
+### 2.2 从节点策略类型转换 CastStoragePolicyOnSlave（含 Bug）
 
 [fs.go#L31-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/42-Cloudreve/pkg/filemanager/manager/fs.go#L31-L63) 在 **Slave 模式**下对策略做类型转换：
 
-- **Remote → Local**：当 Remote 策略的 NodeID 等于当前从节点 ID 时，转为 Local 直接访问本地磁盘
-- **Local → Remote**：Slave 上的 Local 策略转为 Remote，通过 Master 的 RPC 操作
-- **OSS → OSS**：清空 `ServerSideEndpoint`，从节点只能用公网 Endpoint 访问
+| 分支 | 策略类型 | 预期行为 | 当前状态 |
+|---|---|---|---|
+| 1 | `Remote` → `Local` | 当 Remote 策略的 NodeID 等于当前从节点 ID 时，转为 Local 直接访问本地磁盘 | ✅ 正常（return &policyCopy） |
+| 2 | `Local` → `Remote` | Slave 上的 Local 策略转为 Remote，通过 Master 的 RPC 操作 | ✅ 正常（return &policyCopy） |
+| 3 | `OSS` → `OSS` | 清空 `ServerSideEndpoint`，从节点只能用公网 Endpoint 访问 | **🐛 Bug**：创建副本后未 return，修改被丢弃 |
+
+**OSS 分支 Bug 详情**：
+
+```go
+// [fs.go#L55-L60]
+} else if policy.Type == types.PolicyTypeOss {
+    policyCopy := *policy
+    if policyCopy.Settings != nil {
+        policyCopy.Settings.ServerSideEndpoint = ""  // 修改了副本
+    }
+    // ❌ 缺少: return &policyCopy
+    //    执行继续落到第 62 行，返回原始 policy，上述清空操作完全失效
+}
+return policy  // ⚠️ 返回的是未修改的原始 policy
+```
+
+**影响**：在 Slave 节点上使用 OSS 策略时，`ServerSideEndpoint`（内网 Endpoint）未被清空，从节点可能尝试通过不可达的内网地址访问 OSS，导致请求失败或超时。
+
+**修复方案**：在 `policyCopy.Settings.ServerSideEndpoint = ""` 之后添加 `return &policyCopy`。
 
 ### 2.3 典型驱动初始化示例
 
@@ -233,7 +254,7 @@ switch policy.Type → 调用具体驱动 New()
 
 ### 3.1 Handler 接口定义
 
-所有驱动实现 [Handler](file:///d:/fz/0601-1/solo-dogfeeding/code/42-Cloudreve/pkg/filemanager/driver/handler.go#L44-L87) 接口，共 13 个方法：
+所有驱动实现 [Handler](file:///d:/fz/0601-1/solo-dogfeeding/code/42-Cloudreve/pkg/filemanager/driver/handler.go#L44-L87) 接口，共 12 个方法：
 
 | 方法 | 功能 | 约束/备注 |
 |---|---|---|
