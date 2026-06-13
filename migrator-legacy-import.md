@@ -13,27 +13,62 @@
 
 ## 1. 整体架构与执行顺序
 
-### 1.1 调用顺序 ✅[代码直接证实]
+### 1.1 两阶段初始化与调用顺序 ✅[代码直接证实]
 
-迁移命令 `cloudreve migrate --v3-conf <path>`（[cmd/migrate.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/cmd/migrate.go)）的内部执行顺序：
+V3→V4 的数据迁移不是一步完成的，而是分为**两个阶段**，分别在不同时机执行：
+
+**阶段 1：`cloudreve migrate` 命令（迁移阶段）**
 
 ```
-1. dependency.NewDependency()
-   └─→ inventory.Init()
-        ├─→ Schema.Create()               // 创建 V4 表结构
-        ├─→ migrateDefaultSettings()      // 补齐缺失的默认设置
-        ├─→ migrateDefaultStoragePolicy() // 补齐默认存储策略(ID=1)
-        ├─→ migrateSysGroups()            // 补齐默认用户组
-        ├─→ migrateOAuthClient()          // 补齐默认 OAuth 客户端
-        └─→ applyPatches()                // 应用版本补丁(如 reset_secret_key)
-
-2. migrator.NewMigrator()                 // 读取 V3 配置，连接 V3 数据库
-                                            // 加载 migration_state.json
-
-3. migrator.Migrate()                     // 执行 V3 → V4 数据迁移（见 1.2 步骤流水线）
+cmd/migrate.go → migrateCmd.Run()
+  │
+  ├─ dependency.NewDependency()           // 只初始化 Logger 和 ConfigProvider
+  │   └─ 不触发 DBClient()（懒加载，migrate 命令未访问）
+  │   └─ 不触发 inventory.InitializeDBClient()
+  │   └─ 不触发 migrateDefaultSettings()
+  │
+  ├─ migrator.NewMigrator(dep, v3ConfPath)
+  │   ├─ conf.Init() → 连接 V3 数据库
+  │   └─ inventory.NewRawEntClient() → 直接创建原始 Ent 客户端
+  │       └─ 绕过 inventory.InitializeDBClient()
+  │
+  └─ migrator.Migrate()                   // V4 数据库此时仅有表结构，无任何数据
+      ├─ StepSchema:  v4client.Schema.Create()
+      ├─ StepSettings: migrateSettings()
+      ├─ StepNode:     migrateNode()
+      ├─ StepPolicy:   migratePolicy()
+      ├─ StepGroup:    migrateGroup()
+      ├─ StepUser:     migrateUser()
+      ├─ ...后续步骤...
+      └─ 完成（不创建 DB 版本标记）
 ```
 
-**关键影响**：`migrateDefaultSettings()` **先于** `Migrator.Migrate()` 执行。因此，被 `noopMigrator` 标记的设置项不会"丢失"——它们中一部分已由 `migrateDefaultSettings()` 根据 V4 的 DefaultSettings 模板补齐了新的默认值，另一部分则是 V4 中已弃用的功能。
+**阶段 2：`cloudreve` 服务器首次启动（补齐阶段）**
+
+```
+cmd/root.go → 服务器启动
+  │
+  └─ dependency.NewDependency()
+      └─ dep.DBClient()（懒加载，首次访问时触发）
+          └─ inventory.InitializeDBClient()
+              ├─ needMigration() → true（DB 版本标记不存在）
+              └─ migrate()
+                  ├─ Schema.Create()              // 幂等，表已存在则跳过
+                  ├─ migrateDefaultSettings()     // 按 name 检查，跳过已存在项，补齐缺失的 V4 专属设置
+                  ├─ migrateDefaultStoragePolicy() // 按 ID=1 检查，跳过已存在项
+                  ├─ migrateSysGroups()            // 按 ID=1,2,3 检查，跳过已存在项
+                  │   └─ migrateMasterNode()       // 按 Type=Master 检查，跳过已存在项
+                  ├─ migrateOAuthClient()          // 创建 OAuth 客户端
+                  ├─ applyPatches()                // 版本补丁
+                  └─ 创建 DB 版本标记              // ← 首次启动后不再重复执行
+```
+
+**关键发现** ✅[代码直接证实]：
+- `migrate` 命令通过 `inventory.NewRawEntClient()` 直接创建 Ent 客户端，**完全绕过** `inventory.InitializeDBClient()`
+- [cmd/migrate.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/cmd/migrate.go) 只调用了 `dep.Logger()`，未调用 `dep.DBClient()`
+- [migrator.go#L145](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L145) 使用 `inventory.NewRawEntClient()` 而非 `dep.DBClient()`
+- 因此 V4 默认资源（设置、策略、用户组、主节点）的创建**晚于** V3 数据导入
+- V3 数据先写入空数据库，V4 默认资源在服务器首次启动时以"查重补缺"方式填入
 
 ### 1.2 迁移步骤流水线 ✅[代码直接证实]
 
@@ -186,23 +221,22 @@ V4 中文件夹和文件统一为 `File` 实体，通过 `Type` 字段区分。
 
 #### 2.7.1 noopMigrator（46 项中的 39 项）✅[代码直接证实]
 
-`noopMigrator` 的语义是：**该设置项在 migrator 范围内不迁移**。具体命运分两类：
+`noopMigrator` 的语义是：**migrator 不负责迁移该设置项**。最终该设置项在 V4 中的值取决于 `migrateDefaultSettings()` 是否为其补了默认值：
 
-**A 类：V4 DefaultSettings 中有新默认值（migrateDefaultSettings 已补齐）**
+**A 类：V4 DefaultSettings 中有同名项 → 最终使用 V4 默认值（V3 原值被丢弃）**
 
-| 设置名 | DefaultSettings 中的值 | 说明 |
+| 设置名 | V4 DefaultSettings 中的值 | 最终结果 |
 |---|---|---|
-| `defaultTheme` | `#1976d2` | V4 改了主题体系 |
-| `theme_options` | 完整的多主题调色板 JSON | V4 改了主题体系 |
-| `max_parallel_transfer` | `4` | V4 默认值 |
-| `secret_key` | `RandStringRunesCrypto(256)` | 随机生成（同时 reset_secret_key patch 也会重置） |
-| `mail_activation_template` | 基于 mailTemplateContents 重新生成的多语言 JSON | V4 重写了邮件模板体系 |
-| `mail_reset_pwd_template` | （无，V4 叫 mail_reset_template） | V4 重命名并重新生成 |
-| `captcha_type` | `normal` | V4 默认 |
+| `defaultTheme` | `#1976d2`（新主题体系） | V4 默认值替代 V3 原值 |
+| `theme_options` | 完整的多主题调色板 JSON | V4 默认值替代 V3 原值 |
+| `max_parallel_transfer` | `4` | V4 默认值替代 V3 原值 |
+| `secret_key` | `RandStringRunesCrypto(256)` 随机生成 | V4 随机值替代 V3 原值 |
+| `mail_activation_template` | 基于 mailTemplateContents 重新生成的多语言 JSON | V4 重新生成替代 V3 原值 |
+| `captcha_type` | `normal` | V4 默认值替代 V3 原值（注：captcha_type 有独立 migrator，但因 DefaultSettings 先写入且 `migrateDefaultSettings` 跳过已存在项，实际走 migrator 逻辑） |
 
-> 注：`captcha_type` 不在 noopMigrator 中，是独立的 migrator，但 migrateDefaultSettings 也有它的默认值。
+> ⚠️ 关于 `mail_reset_pwd_template`：V3 中的名称是 `mail_reset_pwd_template`，V4 DefaultSettings 中的名称是 `mail_reset_template`，**名称不同**。因此 V3 的 `mail_reset_pwd_template` 由 noopMigrator 丢弃后，不会与 V4 的 `mail_reset_template` 冲突，两者独立存在。
 
-**B 类：完全弃用（V4 DefaultSettings 中无对应项）**
+**B 类：V4 DefaultSettings 中无同名项 → 最终该设置在 V4 中不存在**
 
 | 类别 | 被弃用的设置项 |
 |---|---|
