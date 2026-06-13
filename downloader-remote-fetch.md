@@ -6,23 +6,23 @@
 
 | 文件 | 作用 |
 |------|------|
-| [pkg/downloader/downloader.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/downloader.go) | 下载器抽象接口与通用状态定义 |
-| [pkg/downloader/aria2/aria2.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go) | Aria2 下载器具体实现 |
-| [pkg/downloader/qbittorrent/qbittorrent.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/qbittorrent/qbittorrent.go) | qBittorrent 下载器具体实现 |
-| [pkg/downloader/slave/slave.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/slave/slave.go) | 从机节点下载器代理（主机 → 从机 HTTP 调用） |
-| [pkg/filemanager/workflows/remote_download.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go) | 远程下载任务工作流核心逻辑（状态机） |
-| [pkg/filemanager/workflows/upload.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/upload.go) | 从机上传任务工作流（下载完成后文件传输） |
-| [pkg/filemanager/workflows/worfklows.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/worfklows.go) | 工作流公共工具（节点分配、临时目录） |
-| [pkg/queue/task.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/task.go) | 通用任务接口、DBTask 实现、状态转换机 |
-| [pkg/queue/queue.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/queue.go) | 任务队列调度器（FIFO、重试、Worker） |
-| [service/explorer/workflows.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go) | HTTP API 服务层（创建下载任务、列表、取消） |
-| [routers/controllers/file.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/controllers/file.go) | HTTP Controller 层（CreateRemoteDownload 等） |
-| [routers/controllers/slave.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/controllers/slave.go) | 从机节点 API（SlaveDownloadTaskCreate/Status/Cancel 等） |
-| [ent/task/task.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/ent/task/task.go) | 数据库 Task 表 Schema 与 Status 枚举 |
+| [pkg/downloader/downloader.go](pkg/downloader/downloader.go) | 下载器抽象接口与通用状态定义 |
+| [pkg/downloader/aria2/aria2.go](pkg/downloader/aria2/aria2.go) | Aria2 下载器具体实现 |
+| [pkg/downloader/qbittorrent/qbittorrent.go](pkg/downloader/qbittorrent/qbittorrent.go) | qBittorrent 下载器具体实现 |
+| [pkg/downloader/slave/slave.go](pkg/downloader/slave/slave.go) | 从机节点下载器代理（主机 → 从机 HTTP 调用） |
+| [pkg/filemanager/workflows/remote_download.go](pkg/filemanager/workflows/remote_download.go) | 远程下载任务工作流核心逻辑（状态机） |
+| [pkg/filemanager/workflows/upload.go](pkg/filemanager/workflows/upload.go) | 从机上传任务工作流（下载完成后文件传输） |
+| [pkg/filemanager/workflows/worfklows.go](pkg/filemanager/workflows/worfklows.go) | 工作流公共工具（节点分配、临时目录） |
+| [pkg/queue/task.go](pkg/queue/task.go) | 通用任务接口、DBTask 实现、状态转换机 |
+| [pkg/queue/queue.go](pkg/queue/queue.go) | 任务队列调度器（FIFO、重试、Worker） |
+| [service/explorer/workflows.go](service/explorer/workflows.go) | HTTP API 服务层（创建下载任务、列表、取消） |
+| [routers/controllers/file.go](routers/controllers/file.go) | HTTP Controller 层（CreateRemoteDownload 等） |
+| [routers/controllers/slave.go](routers/controllers/slave.go) | 从机节点 API（SlaveDownloadTaskCreate/Status/Cancel 等） |
+| [ent/task/task.go](ent/task/task.go) | 数据库 Task 表 Schema 与 Status 枚举 |
 
 ### 1.2 请求入口路由
 
-在 [router.go:576-596](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/router.go#L576-L596) 注册：
+在 [router.go:576-596](routers/router.go#L576-L596) 注册：
 
 ```
 POST   /api/v4/workflow/download          创建远程下载任务
@@ -38,7 +38,7 @@ DELETE /api/v4/workflow/download/:id      取消下载任务
 
 #### 第一层：数据库任务状态（ent/task.Status）
 
-定义于 [ent/task/task.go:97-104](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/ent/task/task.go#L97-L104)：
+定义于 [task.go:97-104](ent/task/task.go#L97-L104)：
 
 ```go
 const (
@@ -51,7 +51,7 @@ const (
 )
 ```
 
-状态转换逻辑定义在 [pkg/queue/task.go:375-473](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/task.go#L375-L473) 的 `stateTransitions` 映射表中：
+状态转换逻辑定义在 [task.go:375-473](pkg/queue/task.go#L375-L473) 的 `stateTransitions` 映射表中：
 
 ```
 "" → StatusQueued                  （新任务持久化）
@@ -70,7 +70,7 @@ StatusSuspending → StatusError      （挂起期间失败）
 
 #### 第二层：下载器内部状态（downloader.Status）
 
-定义于 [pkg/downloader/downloader.go:64-70](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/downloader.go#L64-L70)：
+定义于 [downloader.go:64-70](pkg/downloader/downloader.go#L64-L70)：
 
 ```go
 const (
@@ -82,7 +82,7 @@ const (
 )
 ```
 
-Aria2 的状态映射见 [aria2.go:105-122](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L105-L122)：
+Aria2 的状态映射见 [aria2.go:105-122](pkg/downloader/aria2/aria2.go#L105-L122)：
 - `active` + 完成度 100% + BT 模式 → `StatusSeeding`
 - `active` → `StatusDownloading`
 - `waiting/paused` → `StatusDownloading`
@@ -92,7 +92,7 @@ Aria2 的状态映射见 [aria2.go:105-122](file:///d:/fz/0601-1/solo-dogfeeding
 
 #### 第三层：工作流阶段（RemoteDownloadTaskPhase）
 
-定义于 [remote_download.go:60-65](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L60-L65)：
+定义于 [remote_download.go:60-65](pkg/filemanager/workflows/remote_download.go#L60-L65)：
 
 ```go
 const (
@@ -103,7 +103,7 @@ const (
 )
 ```
 
-状态机入口是 [RemoteDownloadTask.Do()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L119-L170)，根据当前 Phase 分发到不同处理函数。
+状态机入口是 [RemoteDownloadTask.Do()](pkg/filemanager/workflows/remote_download.go#L119-L170)，根据当前 Phase 分发到不同处理函数。
 
 ## 3. 任务执行完整流程
 
@@ -139,7 +139,7 @@ workflows.RemoteDownloadTask.Do()
 
 ### 4.1 轮询调度流程
 
-核心函数 [monitor()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L246-L324)：
+核心函数 [monitor()](pkg/filemanager/workflows/remote_download.go#L246-L324)：
 
 ```go
 func (m *RemoteDownloadTask) monitor(ctx, dep) (task.Status, error) {
@@ -210,10 +210,10 @@ func (m *RemoteDownloadTask) monitor(ctx, dep) (task.Status, error) {
 
 | 操作 | 主机代理方法 | 从机 API 路径 | 从机 Controller |
 |------|-------------|---------------|----------------|
-| 创建任务 | [slave.go:CreateTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/slave/slave.go#L38-L71) | `POST /api/v4/slave/download/task` | [SlaveDownloadTaskCreate()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/controllers/slave.go#L133-L144) |
-| 查询状态 | [slave.go:Info()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/slave/slave.go#L73-L109) | `POST /api/v4/slave/download/status` | [SlaveDownloadTaskStatus()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/controllers/slave.go#L147-L164) |
-| 取消任务 | [slave.go:Cancel()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/slave/slave.go#L111-L138) | `POST /api/v4/slave/download/cancel` | [SlaveCancelDownloadTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/controllers/slave.go#L167-L178) |
-| 选择文件 | [slave.go:SetFilesToDownload()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/slave/slave.go#L140-L168) | `POST /api/v4/slave/download/select` | [SlaveSelectFilesToDownload()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/controllers/slave.go#L181-L192) |
+| 创建任务 | [slave.go:CreateTask()](pkg/downloader/slave/slave.go#L38-L71) | `POST /api/v4/slave/download/task` | [SlaveDownloadTaskCreate()](routers/controllers/slave.go#L133-L144) |
+| 查询状态 | [slave.go:Info()](pkg/downloader/slave/slave.go#L73-L109) | `POST /api/v4/slave/download/status` | [SlaveDownloadTaskStatus()](routers/controllers/slave.go#L147-L164) |
+| 取消任务 | [slave.go:Cancel()](pkg/downloader/slave/slave.go#L111-L138) | `POST /api/v4/slave/download/cancel` | [SlaveCancelDownloadTask()](routers/controllers/slave.go#L167-L178) |
+| 选择文件 | [slave.go:SetFilesToDownload()](pkg/downloader/slave/slave.go#L140-L168) | `POST /api/v4/slave/download/select` | [SlaveSelectFilesToDownload()](routers/controllers/slave.go#L181-L192) |
 
 从机收到请求后，使用本地真实下载器（Aria2/qBittorrent）执行操作，并通过 Gob 编码返回结果。
 
@@ -223,7 +223,7 @@ func (m *RemoteDownloadTask) monitor(ctx, dep) (task.Status, error) {
 
 ### 5.1 主机节点传输（masterTransfer）
 
-代码见 [remote_download.go:428-557](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L428-L557)
+代码见 [remote_download.go:428-557](pkg/filemanager/workflows/remote_download.go#L428-L557)
 
 ```
 masterTransfer()
@@ -242,14 +242,14 @@ masterTransfer()
   └─ 全部成功 → Phase = AwaitSeeding，返回 StatusSuspending
 ```
 
-核心落库路径 [manager.Update()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/manager/upload.go#L326-L367)：
+核心落库路径 [manager.Update()](pkg/filemanager/manager/upload.go#L326-L367)：
 1. `PrepareUpload()`：在 DBFS 中准备上传会话（创建文件 Entity、锁定目标路径）
 2. `Upload()`：将文件流写入实际存储策略（本地/OSS/S3 等）
 3. `CompleteUpload()`：更新文件元数据、清除上传会话、触发媒体元数据提取和全文索引任务
 
 ### 5.2 从机节点传输（slaveTransfer）
 
-代码见 [remote_download.go:326-426](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L326-L426)
+代码见 [remote_download.go:326-426](pkg/filemanager/workflows/remote_download.go#L326-L426)
 
 从机不直接访问主机数据库，而是通过创建 **SlaveUploadTask** 由从机自身执行：
 
@@ -271,7 +271,7 @@ slaveTransfer()
           └─ 其他 → 30 秒后再查
 ```
 
-从机端执行 SlaveUploadTask 的逻辑见 [upload.go:69-223](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/upload.go#L69-L223) 的 `SlaveUploadTask.Do()`，它使用 **stateless 模式**调用主机 API 完成落库：
+从机端执行 SlaveUploadTask 的逻辑见 [upload.go:69-223](pkg/filemanager/workflows/upload.go#L69-L223) 的 `SlaveUploadTask.Do()`，它使用 **stateless 模式**调用主机 API 完成落库：
 
 ```
 SlaveUploadTask.Do()（在从机上执行）
@@ -291,14 +291,14 @@ SlaveUploadTask.Do()（在从机上执行）
 
 - 所有任务状态（PublicState + PrivateState）均持久化在 DB 的 `tasks` 表中
 - PrivateState 是 JSON 字符串，包含 `RemoteDownloadTaskState` 完整信息（Handle、Phase、Transferred、NodeID 等）
-- 队列启动时 [queue.go:93-131](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/queue.go#L93-L131) 的 `Start()` 会：
+- 队列启动时 [queue.go:93-131](pkg/queue/queue.go#L93-L131) 的 `Start()` 会：
   1. 调用 `taskClient.GetPendingTasks()` 拉取未完成任务
   2. 通过 `NewTaskFromModel()` 用注册的工厂恢复为具体 Task 实例
   3. 重新入队 `QueueTask()` 继续执行
 
 ### 6.2 节点分配的固定性
 
-[allocateNode()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/worfklows.go#L29-L42) 会优先使用 `state.NodeID` 中已保存的节点：
+[allocateNode()](pkg/filemanager/workflows/worfklows.go#L29-L42) 会优先使用 `state.NodeID` 中已保存的节点：
 ```go
 func allocateNode(ctx, dep, state *NodeState, capability) (cluster.Node, error) {
     node, err := np.Get(ctx, capability, state.NodeID)  // 传入 NodeID 优先复用
@@ -318,7 +318,7 @@ func allocateNode(ctx, dep, state *NodeState, capability) (cluster.Node, error) 
 
 ### 6.4 已创建下载任务的去重
 
-[createDownloadTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L172-L226) 入口检查：
+[createDownloadTask()](pkg/filemanager/workflows/remote_download.go#L172-L226) 入口检查：
 ```go
 if m.state.Handle != nil {
     m.state.Phase = RemoteDownloadTaskPhaseMonitor
@@ -329,7 +329,7 @@ if m.state.Handle != nil {
 
 ### 6.5 失败重试机制
 
-- **队列级重试**：[queue.go:296-313](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/queue.go#L296-L313)，非 CriticalErr 且未超 maxRetry 时，使用指数退避延迟重试
+- **队列级重试**：[queue.go:296-313](pkg/queue/queue.go#L296-L313)，非 CriticalErr 且未超 maxRetry 时，使用指数退避延迟重试
 - **getTaskStatus 级重试**：`monitor()` 中连续获取状态失败最多 5 次
 - **CriticalErr**：被标记为 `CriticalErr` 的错误（如 URL 非法、容量不足、参数错误）不进行重试，直接返回 `StatusError`
 
@@ -337,7 +337,7 @@ if m.state.Handle != nil {
 
 任务到达 `StatusCompleted/Error/Canceled` 时，状态转换机自动调用 `task.Cleanup()`：
 
-[remote_download.go:595-609](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L595-L609)：
+[remote_download.go:595-609](pkg/filemanager/workflows/remote_download.go#L595-L609)：
 ```go
 func (m *RemoteDownloadTask) Cleanup(ctx) error {
     // 1. 取消下载器中的任务
@@ -424,16 +424,16 @@ type Task struct {
 | 任务列表 | `GET /api/v4/workflow?category=downloading|downloaded` | 查询任务列表与 Summary |
 | 任务进度 | `GET /api/v4/workflow/progress/:id` | 查询单个任务的实时 Progress |
 
-路由注册见 [router.go:554-561](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/router.go#L554-L561)。
+路由注册见 [router.go:554-561](routers/router.go#L554-L561)。
 
 ### 9.2 任务列表与 Summary
 
-`ListTasks()` 定义于 [workflows.go:324-384](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L324-L384)，按 `category` 分类查询：
+`ListTasks()` 定义于 [workflows.go:324-384](service/explorer/workflows.go#L324-L384)，按 `category` 分类查询：
 
 - **downloading**：查询状态为 `StatusSuspending / StatusProcessing / StatusQueued` 的远程下载任务，`PageSize` 强制设为 `intsets.MaxInt`（即一次性返回所有进行中任务）
 - **downloaded**：查询状态为 `StatusCanceled / StatusError / StatusCompleted` 的远程下载任务
 
-每个任务通过 `task.Summarize(hasher)` 生成摘要，返回到前端的 `TaskResponse` 结构体（[response.go:88-101](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/response.go#L88-L101)）：
+每个任务通过 `task.Summarize(hasher)` 生成摘要，返回到前端的 `TaskResponse` 结构体（[response.go:88-101](service/explorer/response.go#L88-L101)）：
 
 ```go
 type TaskResponse struct {
@@ -454,7 +454,7 @@ type TaskResponse struct {
 
 ### 9.3 Summarize 返回内容
 
-[RemoteDownloadTask.Summarize()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L629-L661) 返回的 Summary 结构：
+[RemoteDownloadTask.Summarize()](pkg/filemanager/workflows/remote_download.go#L629-L661) 返回的 Summary 结构：
 
 ```go
 &queue.Summary{
@@ -487,7 +487,7 @@ type TaskResponse struct {
 
 ### 9.4 实时进度查询
 
-[TaskPhaseProgress()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L386-L396) 从内存中的 `TaskRegistry` 获取运行中任务的 `Progress()`：
+[TaskPhaseProgress()](service/explorer/workflows.go#L386-L396) 从内存中的 `TaskRegistry` 获取运行中任务的 `Progress()`：
 
 ```go
 func TaskPhaseProgress(c *gin.Context, taskID int) (queue.Progresses, error) {
@@ -500,7 +500,7 @@ func TaskPhaseProgress(c *gin.Context, taskID int) (queue.Progresses, error) {
 }
 ```
 
-[RemoteDownloadTask.Progress()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L663-L679) 合并两个来源的进度：
+[RemoteDownloadTask.Progress()](pkg/filemanager/workflows/remote_download.go#L663-L679) 合并两个来源的进度：
 
 ```go
 func (m *RemoteDownloadTask) Progress(ctx) queue.Progresses {
@@ -519,7 +519,7 @@ func (m *RemoteDownloadTask) Progress(ctx) queue.Progresses {
 }
 ```
 
-进度 key 的含义（定义于 [archive.go:69-72](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/archive.go#L69-L72) 和 [remote_download.go:71-72](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L71-L72)）：
+进度 key 的含义（定义于 [archive.go:69-72](pkg/filemanager/workflows/archive.go#L69-L72) 和 [remote_download.go:71-72](pkg/filemanager/workflows/remote_download.go#L71-L72)）：
 
 | key | 含义 | Total | Current |
 |-----|------|-------|---------|
@@ -553,7 +553,7 @@ func (m *RemoteDownloadTask) Progress(ctx) queue.Progresses {
 
 ### 10.1 创建入口无 URL 级去重
 
-[CreateDownloadTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L81-L169) 的逻辑：
+[CreateDownloadTask()](service/explorer/workflows.go#L81-L169) 的逻辑：
 
 ```go
 // 批量创建——遍历 Src 列表，每个 URL 创建一个独立任务
@@ -571,7 +571,7 @@ for _, src := range service.Src {
 
 ### 10.2 批量数量限制
 
-唯一的限流手段是 `Aria2BatchSize`（[workflows.go:114-117](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L114-L117)）：
+唯一的限流手段是 `Aria2BatchSize`（[workflows.go:114-117](service/explorer/workflows.go#L114-L117)）：
 
 ```go
 limit := user.Edges.Group.Settings.Aria2BatchSize
@@ -584,13 +584,13 @@ if limit > 0 && len(service.Src) > limit {
 
 ### 10.3 队列级也无去重
 
-[QueueTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/queue.go#L184-L209) 只做以下操作：
+[QueueTask()](pkg/queue/queue.go#L184-L209) 只做以下操作：
 1. 状态转 `StatusQueued`
 2. 持久化到 DB
 3. 推入 FIFO 调度器
 4. 注册到 TaskRegistry（`registry.Set(t.ID(), t)`）
 
-FIFO 调度器（[scheduler.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/scheduler.go)）按 `ResumeTime` 最小堆排序，无去重逻辑。TaskRegistry 是 `map[int]Task`，按 DB 自增 ID 索引，也不会检测重复。
+FIFO 调度器（[scheduler.go](pkg/queue/scheduler.go)）按 `ResumeTime` 最小堆排序，无去重逻辑。TaskRegistry 是 `map[int]Task`，按 DB 自增 ID 索引，也不会检测重复。
 
 ### 10.4 下载器级可能的隐式去重
 
@@ -604,38 +604,26 @@ Aria2 本身可能对相同 URL 的重复添加产生不同 GID（不同任务�
 
 ### 10.6 重启恢复时的重复风险
 
-[GetPendingTasks()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/inventory/task.go#L165-L187) 查询所有 `StatusIn(processing, queued, suspending)` 的任务并重新入队。如果重启前有重复 URL 的任务，重启后都会恢复执行，不存在去重。
+[GetPendingTasks()](inventory/task.go#L165-L187) 查询所有 `StatusIn(processing, queued, suspending)` 的任务并重新入队。如果重启前有重复 URL 的任务，重启后都会恢复执行，不存在去重。
 
 **总结**：当前系统**不提供任何 URL 级去重机制**，同一 URL 可以被重复提交，产生独立的下载任务并最终在目标路径创建文件版本。
 
-## 11. 本机路径问题分析
+## 11. 本机路径问题分析（文档路径 vs 运行时路径）
 
-### 11.1 masterTransfer 的路径拼接
+> **核心区分**：本文档中出现的路径有两类，需要明确区分：
+> - **文档引用路径**（如 `pkg/downloader/aria2/aria2.go`）：是相对于仓库根目录的文件路径，仅用于让读者定位源码，与程序运行时完全无关
+> - **运行时文件系统路径**（如 `SavePath`、`file.Name`、`src`）：是程序运行时在服务器磁盘上实际读写的路径，由下载器、操作系统和配置共同决定
 
-[remote_download.go:471](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L471) 的关键路径构建：
+### 11.1 运行时路径的完整生命周期
 
-```go
-src := filepath.FromSlash(path.Join(m.state.Status.SavePath, file.Name))
-```
+运行时路径经历 **生成 → 序列化 → 反序列化 → 打开文件** 四个阶段，下面沿代码逐一追踪。
 
-这里混合使用了两个包：
-- `path.Join`：POSIX 风格路径拼接（正斜杠）
-- `filepath.FromSlash`：将正斜杠转为操作系统路径分隔符
+#### 阶段一：生成临时目录（CreateTask）
 
-`SavePath` 来自 Aria2 的 `status.Dir` 字段，在 [aria2.go:130](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L130) 中被转为正斜杠：
+Aria2 在 [aria2.go:277-291](pkg/downloader/aria2/aria2.go#L277-L291) 生成临时下载目录：
 
 ```go
-savePath := filepath.ToSlash(status.Dir)
-```
-
-因此 `path.Join(SavePath, file.Name)` 总是先拼接出 POSIX 路径，再由 `filepath.FromSlash` 转为系统路径。在 Windows 上最终是反斜杠路径。
-
-### 11.2 SavePath 的生成
-
-Aria2 任务的临时保存路径由 [aria2.go:277-291](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L277-L291) 生成：
-
-```go
-func (a *aria2Client) tempPath(ctx) string {
+func (a *aria2Client) tempPath(ctx context.Context) string {
     guid, _ := uuid.NewV4()
     base := util.RelativePath(a.options.TempPath)
     if a.options.TempPath == "" {
@@ -646,12 +634,33 @@ func (a *aria2Client) tempPath(ctx) string {
 }
 ```
 
-每次创建下载任务时生成唯一的临时目录，传入 Aria2 作为 `dir` 选项。
+- `util.RelativePath()`（[path.go:59-69](pkg/util/path.go#L59-L69)）的行为：
+  - 如果已经是绝对路径，原样返回
+  - 否则基于可执行文件所在目录拼接：`filepath.Join(filepath.Dir(os.Executable()), name)`
+- `filepath.Join` 使用操作系统原生分隔符拼接：
+  - Linux: `/var/cloudreve/data/aria2/550e8400-e29b-41d4-a716-446655440000`
+  - Windows: `C:\cloudreve\data\aria2\550e8400-e29b-41d4-a716-446655440000`
+- **此路径以 OS 原生格式传入 Aria2 RPC 的 `dir` 选项**，Aria2 直接使用此路径保存文件
 
-### 11.3 file.Name 的来源
+qBittorrent 在 [qbittorrent.go:251-263](pkg/downloader/qbittorrent/qbittorrent.go#L251-L263) 同样调用 `filepath.Join` 生成路径，通过 `savepath` 字段传给 qBittorrent API。
 
-`file.Name` 来自 Aria2 RPC 返回的文件信息，在 [aria2.go:148-149](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L148-L149) 中被处理为相对路径：
+#### 阶段二：序列化到 SavePath（Info）
 
+当工作流调用 `Info()` 获取下载状态时，下载器将 RPC 返回的 `Dir` 转为正斜杠格式：
+
+Aria2（[aria2.go:130](pkg/downloader/aria2/aria2.go#L130)）：
+```go
+savePath := filepath.ToSlash(status.Dir)
+```
+
+qBittorrent（[qbittorrent.go:210](pkg/downloader/qbittorrent/qbittorrent.go#L210)）：
+```go
+SavePath: filepath.ToSlash(torrents[0].SavePath),
+```
+
+**为什么用 `filepath.ToSlash`？** 因为 `SavePath` 和 `file.Name` 会被 JSON 序列化存入数据库（`PrivateState` 字段），跨平台传输时正斜杠是通用格式。特别是从机模式下，主机和从机的操作系统可能不同，正斜杠是安全的中间表示。
+
+Aria2 的 `file.Name`（[aria2.go:148-152](pkg/downloader/aria2/aria2.go#L148-L152)）也用正斜杠相对路径：
 ```go
 relPath := strings.TrimPrefix(filepath.ToSlash(item.Path), savePath)
 if len(relPath) > 0 {
@@ -659,37 +668,93 @@ if len(relPath) > 0 {
 }
 ```
 
-即 `file.Name` 是相对于 `SavePath` 的相对路径。对于 BT 多文件下载，可能是 `子目录/文件名` 的形式。
+qBittorrent 的 `file.Name`（[qbittorrent.go:216](pkg/downloader/qbittorrent/qbittorrent.go#L216)）直接用 `filepath.ToSlash`：
+```go
+Name: filepath.ToSlash(item.Name),
+```
 
-### 11.4 路径问题的具体风险
+> **注意 qBittorrent 与 Aria2 的 file.Name 语义差异**：
+> - Aria2：`file.Name` 是相对于 `SavePath` 的相对路径（去掉了前缀），如 `subdir/file.txt`
+> - qBittorrent：`file.Name` 是 torrent 内部的文件名（可能包含子目录），如 `torrent-name/subdir/file.txt`
 
-1. **Windows 路径分隔符问题**：`SavePath` 经 `filepath.ToSlash` 转为正斜杠，但 Aria2 在 Windows 上实际使用的 `Dir` 是反斜杠路径。如果 Aria2 配置的 `TempPath` 包含反斜杠，`filepath.ToSlash` 后再 `path.Join` 可能产生混合分隔符的路径。
+#### 阶段三：反序列化并在工作流中使用
 
-2. **BT 多文件目录结构**：当 BT 种子包含子目录时，`file.Name` 为 `子目录/文件名`。`path.Join(SavePath, file.Name)` 拼接后 `os.Open(src)` 要求文件系统上实际存在该嵌套路径。
+从 DB 反序列化后，`SavePath` 是正斜杠字符串，`file.Name` 也是正斜杠字符串。
 
-3. **从机路径差异**：[slaveTransfer](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L357) 中使用 `path.Join`（不加 `filepath.FromSlash`）：
+#### 阶段四：打开文件（masterTransfer / slaveTransfer）
 
-   ```go
-   src := path.Join(m.state.Status.SavePath, f.Name)
-   ```
+**主机节点**在 [remote_download.go:471](pkg/filemanager/workflows/remote_download.go#L471) 拼接并打开：
 
-   从机路径直接传给从机的 `SlaveUploadTask`，由从机自己打开文件。这里**没有做 `filepath.FromSlash` 转换**，但 `SlaveUploadTask.Do()` 中打开文件使用的是 `filepath.FromSlash(file.Src)`（[upload.go:134](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/upload.go#L134)）：
+```go
+src := filepath.FromSlash(path.Join(m.state.Status.SavePath, file.Name))
+// ↓ 在 Windows 上
+// path.Join("C:/cloudreve/data/aria2/uuid", "subdir/file.txt")
+//   → "C:/cloudreve/data/aria2/uuid/subdir/file.txt"  (POSIX 风格中间结果)
+// filepath.FromSlash(...)
+//   → "C:\cloudreve\data\aria2\uuid\subdir\file.txt"  (OS 原生路径)
+// os.Open(src)  → 用 OS 原生路径打开文件
+```
 
-   ```go
-   handle, err := os.Open(filepath.FromSlash(file.Src))
-   ```
+流程：`path.Join`（POSIX 拼接）→ `filepath.FromSlash`（转 OS 分隔符）→ `os.Open`。
 
-   所以从机路径实际上是在打开时才做转换，与主机的处理时机不同但效果一致。
+**从机节点**在 [remote_download.go:357](pkg/filemanager/workflows/remote_download.go#L357) 构建路径：
 
-4. **Cleanup 的路径安全**：[Cleanup()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L602) 使用 `os.RemoveAll(m.state.Status.SavePath)` 删除临时目录。`SavePath` 来自下载器状态，如果下载器返回的路径被篡改或异常，可能产生误删风险。但 `SavePath` 仅在主机节点且非空时才执行删除，且路径由系统生成（UUID 目录），风险较低。
+```go
+src := path.Join(m.state.Status.SavePath, f.Name)
+// ↓ 结果是纯 POSIX 正斜杠字符串，如 "C:/cloudreve/data/aria2/uuid/subdir/file.txt"
+```
 
-5. **目标路径 sanitize**：目标文件名通过 [sanitizeFileName()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L681-L684) 处理：
+这个 POSIX 字符串通过 JSON 传给从机的 `SlaveUploadTask`，从机在 [upload.go:134](pkg/filemanager/workflows/upload.go#L134) 打开时才转换：
 
-   ```go
-   func sanitizeFileName(name string) string {
-       r := strings.NewReplacer("\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
-       return r.Replace(name)
-   }
-   ```
+```go
+handle, err := os.Open(filepath.FromSlash(file.Src))
+// ↓ 在 Windows 上转为 "C:\cloudreve\data\aria2\uuid\subdir\file.txt"
+```
 
-   将 Windows 不允许的字符替换为下划线。但源文件路径 `src` 不做 sanitize——因为它由下载器生成，被假定为合法的文件系统路径。
+**结论：两条路径最终效果一致，只是 `filepath.FromSlash` 的调用时机不同——主机在拼接时立即转换，从机在打开时才转换。**
+
+### 11.2 Cleanup 中的路径
+
+[Cleanup()](pkg/filemanager/workflows/remote_download.go#L595-L609) 中删除临时目录：
+
+```go
+if m.state.Status != nil && m.node.IsMaster() && m.state.Status.SavePath != "" {
+    os.RemoveAll(m.state.Status.SavePath)
+}
+```
+
+此处 `SavePath` 仍是正斜杠格式（从 DB 反序列化而来）。`os.RemoveAll` 在 Windows 上也能正确处理正斜杠路径（Go 的 `os` 包内部会转换），所以不会有问题。
+
+Aria2 的 `Cancel()` 在 [aria2.go:206-212](pkg/downloader/aria2/aria2.go#L206-L212) 使用 `status.SavePath`（也是正斜杠）传给 `os.RemoveAll`，同样安全。
+
+### 11.3 运行时路径的潜在风险
+
+1. **qBittorrent file.Name 不是相对路径**：qBittorrent 返回的 `file.Name` 是 `filepath.ToSlash(item.Name)`，通常包含种子名称前缀（如 `ubuntu-22.04/file.txt`）。当 `masterTransfer` 拼接 `path.Join(SavePath, file.Name)` 时，路径变为 `savepath/ubuntu-22.04/file.txt`。而 qBittorrent 实际保存的文件路径是 `SavePath/ubuntu-22.04/file.txt`，与拼接结果一致，**不会出问题**。但如果 qBittorrent 返回的 `Name` 字段与实际目录结构不完全匹配，就会出现 `os.Open` 找不到文件的错误。
+
+2. **跨 OS 主从部署**：如果主机是 Linux、从机是 Windows（或反过来），`SavePath` 的正斜杠中间表示是正确的——因为 `filepath.FromSlash` 会在实际使用端按本地 OS 转换。但如果 Aria2/qBittorrent 运行在从机上，而 `SavePath` 中的根路径（如 `/tmp/`）在 Windows 上无意义，则 `os.Open` 会失败。**这不是代码 bug，而是部署约束**——从机下载器的临时路径必须是本机有效路径。
+
+3. **Windows 长路径**：临时路径经过 `filepath.Join(base, "aria2", uuid)` 三层嵌套，再加上种子内部目录结构，可能超过 Windows 260 字符限制。Go 默认使用长路径前缀（`\\?\`）可缓解，但 Aria2/qBittorrent 自身不一定支持。
+
+### 11.4 目标路径的 sanitize
+
+目标文件名（非源文件路径）通过 [sanitizeFileName()](pkg/filemanager/workflows/remote_download.go#L681-L684) 处理：
+
+```go
+func sanitizeFileName(name string) string {
+    r := strings.NewReplacer("\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+    return r.Replace(name)
+}
+```
+
+将 Windows 不允许的字符替换为下划线。源文件路径 `src` 不做 sanitize——因为它是下载器生成的本地路径，被假定为文件系统上合法且存在的路径。
+
+### 11.5 Summarize 中的路径脱敏
+
+[Summarize()](pkg/filemanager/workflows/remote_download.go#L629-L661) 中将 `SavePath` 置空后返回给前端：
+
+```go
+status := &*m.state.Status
+status.SavePath = ""   // 脱敏：不暴露服务器本地路径
+```
+
+因此前端永远看不到 `SavePath`，只能通过 `Summary.download.downloaded/total` 等字段获取进度信息。
