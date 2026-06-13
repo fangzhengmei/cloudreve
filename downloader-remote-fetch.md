@@ -1,4 +1,4 @@
-﻿# 远程下载任务代码分析
+# 远程下载任务代码分析
 
 ## 1. 整体架构与代码路径
 
@@ -831,15 +831,105 @@ if m.state.Status != nil && m.node.IsMaster() && m.state.Status.SavePath != "" {
 
 Aria2 的 `Cancel()` 在 [aria2.go:206-212](pkg/downloader/aria2/aria2.go#L206-L212) 使用 `status.SavePath`（也是正斜杠）传给 `os.RemoveAll`，同样安全。
 
-### 11.3 运行时路径的潜在风险
+### 11.3 目标侧子目录链式补建机制
+
+当远程下载的 `file.Name` 含目录层级（如 `subdir/MyFile.txt`）时，目标侧 URI 变成 `cr:///我的下载/subdir/MyFile.txt`。如果 `subdir` 目录在 Cloudreve 中尚不存在，`dbfs.Create()` 会自动沿路径元素链式补建缺失的中间文件夹。
+
+#### 11.3.1 核心循环
+
+代码位于 [manage.go:73-145](pkg/filemanager/fs/dbfs/manage.go#L73-L145)：
+
+```go
+// 1. 拆分路径元素
+existedElements := ancestor.Uri(false).Elements()  // 已存在路径的元素
+desired := path.Elements()                          // 目标路径的全部元素
+// 示例：目标 cr:///我的下载/subdir/MyFile.txt
+//   existedElements = ["我的下载"]        （用户根目录下已存在的文件夹）
+//   desired         = ["我的下载", "subdir", "MyFile.txt"]
+//   Elements() 是 URI.PathTrimmed() 按 "/" 分割的结果
+
+// 2. 如果需要补建的层级 >1 且禁用链式创建，直接报错
+if (len(desired)-len(existedElements) > 1) && o.noChainedCreation {
+    return nil, fs.ErrPathNotExist
+}
+
+// 3. 从已存在的位置开始，逐段补建
+for i := len(existedElements); i < len(desired); i++ {
+    // 确认父节点是文件夹
+    if !ancestor.CanHaveChildren() { return error }
+
+    // 对每一段路径元素做基础文件名校验
+    if err := validateFileName(desired[i]); err != nil {
+        return nil, fs.ErrIllegalObjectName.WithError(err)
+    }
+
+    // 分支 A：中间元素（非最后一段）或目标本身就是文件夹 → 创建文件夹
+    if i < len(desired)-1 || fileType == types.FileTypeFolder {
+        newFolder, err := fc.CreateFolder(ctx, ancestor.Model, args)
+        ancestor = newFile(ancestor, newFolder)  // 新文件夹成为下一轮的父节点
+    } else {
+        // 分支 B：最后一段且是文件 → 校验扩展名 + 正则，然后创建文件
+        validateExtension(desired[i], policy)
+        validateFileNameRegexp(desired[i], policy)
+        file, err := f.createFile(ctx, ancestor, desired[i], fileType, o)
+        return file, nil
+    }
+}
+```
+
+循环的关键特征：
+- **`ancestor` 变量在循环中逐段推进**：每创建一个中间文件夹，`ancestor` 就更新为新创建的文件夹，作为下一段的父节点。这样就形成了链式补建。
+- **中间元素只创建文件夹**：所有 `i < len(desired)-1` 的元素一律按文件夹处理，不考虑文件扩展名或正则。
+- **最后一段才区分文件/文件夹**：根据调用方传入的 `fileType` 决定。
+
+#### 11.3.2 逐段校验行为
+
+`validateFileName()` 定义于 [validator.go:17-31](pkg/filemanager/fs/dbfs/validator.go#L17-L31)：
+
+```go
+func validateFileName(name string) error {
+    if len(name) >= MaxFileNameLength || len(name) == 0 {
+        return fmt.Errorf("length of name must be between 1 and 255")
+    }
+    if strings.ContainsAny(name, "\\/:*?\"<>|") {
+        return fmt.Errorf("name contains illegal characters")
+    }
+    if name == "." || name == ".." {
+        return fmt.Errorf("name cannot be only dot")
+    }
+    return nil
+}
+```
+
+完整校验矩阵（按路径元素位置区分）：
+
+| 校验项 | 中间目录元素（`i < len(desired)-1`） | 最后一个文件元素 |
+|--------|-------------------------------------|----------------|
+| `validateFileName`（长度 1-255 / 非法字符 `\ /:*?"<>|` / `.` 和 `..`） | ✅ 每段都做 | ✅ 做 |
+| `validateExtension`（存储策略扩展名黑白名单） | ❌ 不做（文件夹无扩展名概念） | ✅ 做 |
+| `validateFileNameRegexp`（存储策略文件名正则） | ❌ 不做 | ✅ 做 |
+| `validateFileSize`（存储策略最大文件大小） | ❌ 不做 | ✅ 做（在 PreValidateUpload 阶段） |
+
+#### 11.3.3 与 PreValidateUpload 的校验分工
+
+目标侧文件名校验分两步执行，各有侧重：
+
+| 阶段 | 代码位置 | 校验内容 |
+|------|---------|---------|
+| **PreValidateUpload**（下载开始前） | [remote_download.go:580-588](pkg/filemanager/workflows/remote_download.go#L580-L588) → [dbfs/upload.go:52-62](pkg/filemanager/fs/dbfs/upload.go#L52-L62) | 用 `path.Base(file.Name)` 只取**最后一段文件名**做 `validateNewFile`（含扩展名、正则、大小）。中间目录名在此阶段**不校验**。 |
+| **PrepareUpload / Create**（实际创建时） | [dbfs/upload.go:198](pkg/filemanager/fs/dbfs/upload.go#L198) → [dbfs/manage.go:80-145](pkg/filemanager/fs/dbfs/manage.go#L80-L145) | 沿 `desired` 元素**逐段**校验所有路径元素。每段都做 `validateFileName`，最后一段额外做扩展名和正则校验。 |
+
+**因此**：中间目录名并非"完全不校验"——它只是跳过了 PreValidateUpload 阶段，但在真正落库的 Create 阶段会被 `validateFileName` 逐段校验长度、非法字符和 `.`/`..`。唯一对中间目录名不做的是扩展名过滤和文件名正则（因为中间目录是文件夹，这两项不适用）。
+
+### 11.4 运行时路径的潜在风险
 
 1. **反斜杠导致源/目标目录层级不一致**：如果 `file.Name` 中含反斜杠 `\`，源路径（不 sanitize）会按反斜杠保留目录层级，但目标路径（sanitize 把 `\` 转 `_`）会丢失层级，变成扁平文件名。导致源文件在嵌套目录里，目标文件在单层目录下。
 
-2. **跨 OS 主从部署**：如果主机是 Linux、从机是 Windows（或反过来），`SavePath` 的正斜杠中间表示是正确的因为 `filepath.FromSlash` 会在实际使用端按本地 OS 转换。但如果下载器运行在从机上，而 `SavePath` 中的根路径（如 `/tmp/`）在 Windows 上无意义，则 `os.Open` 会失败。**这不是代码 bug，而是部署约束**从机下载器的临时路径必须是本机有效路径。
+2. **跨 OS 主从部署**：如果主机是 Linux、从机是 Windows（或反过来），`SavePath` 的正斜杠中间表示是正确的——因为 `filepath.FromSlash` 会在实际使用端按本地 OS 转换。但如果下载器运行在从机上，而 `SavePath` 中的根路径（如 `/tmp/`）在 Windows 上无意义，则 `os.Open` 会失败。**这不是代码 bug，而是部署约束**——从机下载器的临时路径必须是本机有效路径。
 
 3. **Windows 长路径**：临时路径经过 `filepath.Join(base, "aria2", uuid)` 三层嵌套，再加上种子内部目录结构，可能超过 Windows 260 字符限制。Go 默认使用长路径前缀（`\\?\`）可缓解，但 Aria2/qBittorrent 自身不一定支持。
 
-4. **PreValidateUpload 只校验最后文件名**：`PreValidateUpload` 内部用 `path.Base(file.Name)`（[dbfs/upload.go:58](pkg/filemanager/fs/dbfs/upload.go#L58)）只取最后一段文件名做存储策略校验，不校验中间目录名。如果 `file.Name` = `subdir/My:File.txt`，只校验 `My_File.txt` 的合法性，`subdir` 目录名是否合法不被校验。
+4. **PreValidateUpload 只校验最后文件名的策略层约束**：`PreValidateUpload` 内部用 `path.Base(file.Name)`（[dbfs/upload.go:58](pkg/filemanager/fs/dbfs/upload.go#L58)）只取最后一段文件名做存储策略校验（扩展名、正则、大小）。中间目录名在此阶段不校验扩展名和正则，但在后续 Create 阶段会被 `validateFileName` 校验基础合法性（长度、非法字符、`.`/`..`）。例如 `file.Name` = `subdir/My:File.txt`，PreValidateUpload 只校验 `My_File.txt` 是否符合扩展名规则，而 `subdir` 目录名是否含非法字符由 Create 阶段逐段校验。
 
 ### 11.4 Summarize 中的路径脱敏
 
