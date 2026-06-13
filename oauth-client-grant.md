@@ -5,10 +5,12 @@
 1. [OAuth Client 配置](#1-oauth-client-配置)
 2. [Grant 生命周期](#2-grant-生命周期)
    - [2.2.5 Grant 在授权确认到换 Token 之间的状态变化](#225-grant-在授权确认到换-token-之间的状态变化补充)
+   - [2.2.6 刷新 grant.last_used_at 的所有操作](#226-哪些操作会刷新-grantlast_used_at代码对照)
 3. [Scope 边界](#3-scope-边界)
    - [3.5 Scope 收缩后的实际生效边界](#35-scope-收缩后的实际生效边界补充)
+   - [3.6 Access Token vs Refresh Token 校验路径逐行对照](#36-access-token-vs-refresh-token代码级校验路径逐行对照)
 4. [撤销风险分析](#4-撤销风险分析)
-   - [4.2.6 撤销后的访问窗口：精确时间线](#426-撤销后的访问窗口精确时间线补充)
+   - [4.2.6 客户端 scope 收缩后遗留访问窗口的完整代码路径](#426-客户端-scope-收缩后遗留访问窗口的完整代码路径)
 
 ---
 
@@ -379,7 +381,9 @@ API 端点访问
 ```
 
 **重要特性**：
-- Scope 只减不增：每次刷新都重新校验，客户端/grant 收缩 scope 后旧 token 立即失效
+- **Access Token scope 不可撤销**：一旦签发就硬编码在 JWT 里，验证时不查数据库，直到过期前始终有效
+- **Refresh Token scope 只校验 grant，不校验 client**：每次刷新时校验 `token.scopes ⊆ grant.scopes`，但**不校验** `token.scopes ⊆ client.scopes`
+- **Client scope 收缩不追溯已有 grant**：管理员缩小 `client.scopes` 后，只要用户不重新 consent 覆盖 `grant.scopes`，已有 Refresh Token 可以无限续期携带旧 scope
 - Write 包含 Read：写入权限隐含读取权限
 - 会话认证绕过 scope：非 OAuth 方式登录的请求不受 scope 限制
 
