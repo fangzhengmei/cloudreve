@@ -189,7 +189,19 @@ type Capabilities struct {
 由于 `ThumbSupportedExts=nil`、`ThumbSupportAllExts=false`，第三层（原生）的判定条件永远为假；而 `ThumbProxy=true` 导致它必然进入第四层（本地代理生成）。又因为 `HandlerCapabilityProxyRequired`，其最终输出的 URL 永远走内部代理模式，不会出现外部直链。
 
 **对 OneDrive 驱动的特别说明**：
-其 `Thumb()` 已完整实现，调用 Microsoft Graph API 获取缩略图 URL。但 Graph API 本身对不支持的文件会返回错误，此时仍需要 `ThumbProxy` 配置作为兜底，回退到本地生成模式。
+其 `Thumb()` 已完整实现，调用 Microsoft Graph API `GetThumbURL` 获取缩略图 URL。但 Graph API 本身对不支持的文件会返回错误，且该错误发生在 Manager 层决策之后，因此**不会触发降级回退到 `ThumbProxy`** 本地生成——错误会直接向上冒泡。详见 5.4 节的分析。
+
+**OneDrive 缩略图错误分类**：
+[onedrive.go#L139-L150](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/driver/onedrive/onedrive.go#L139-L150)
+
+OneDrive 的 `Thumb()` 方法对 Graph API 返回的错误做了明确分类：
+- **业务不可用错误**（可识别的"不支持"类）：
+  - `ErrThumbSizeNotFound`：Graph API 响应中不存在 `large` 尺寸的缩略图
+  - `itemNotFound`：文件/项在 OneDrive 中不存在
+  - 以上两种会被包装为 `fmt.Errorf("thumb not supported in OneDrive: %w", err)` 返回
+- **其他运行时错误**：网络错误、Token 过期、权限不足等，直接原样向上抛出
+
+但由于判定与执行是分离的，这些错误都无法触发 Manager 层的降级。
 
 ---
 
