@@ -485,6 +485,209 @@ wopi := noAuth.Group("file/wopi",
 }
 ```
 
+### 4.6 历史版本读取与回写一致性
+
+> **⚠️ 关键发现**：打开历史版本后的编辑存在严重的一致性问题 —— 读取的是历史版本，但回写的是最新版本。
+
+#### 4.6.1 读取时锁定的版本
+
+**核心代码**：
+- 会话创建：[manager/viewer.go L46-L70](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/filemanager/manager/viewer.go#L46-L70)
+- 实体查找：[fs.go L711-L734](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/filemanager/fs/fs.go#L711-L734)
+- GetFile：[viewer.go L280-L284](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/viewer.go#L280-L284)
+
+**版本锁定机制**：
+
+```go
+// 会话创建时，version 参数被保存到 ViewerSessionCache
+sessionCache := &ViewerSessionCache{
+    ID:       sessionID,
+    Uri:      file.Uri(false).String(),
+    UserID:   m.user.ID,
+    ViewerID: viewer.ID,
+    FileID:   file.ID(),
+    Version:  version,  // ← 版本号被持久化到会话缓存
+    Token:    fmt.Sprintf("%s.%s", sessionID, token),
+}
+
+// FindDesiredEntity 根据 version 查找目标实体
+func FindDesiredEntity(file File, version string, hasher hashid.Encoder, entityType *types.EntityType) (bool, Entity) {
+    if version == "" {
+        // version 为空时返回主实体（最新版本）
+        return true, file.PrimaryEntity()
+    }
+    // version 非空时，解码并查找特定的历史版本实体
+    requestedVersion, err := hasher.Decode(version, hashid.EntityID)
+    for _, entity := range file.Entities() {
+        if entity.ID() == requestedVersion && (entityType == nil || *entityType == entity.Type()) {
+            return true, entity
+        }
+    }
+    // ...
+}
+```
+
+**读取路径**：
+```
+GetFile (viewer.go L268)
+    ↓
+fs.FindDesiredEntity(file, viewerSession.Version, ...)  (L281)
+    ↓
+根据 session.Version 找到历史版本实体 targetEntity
+    ↓
+m.GetEntitySource(c, targetEntity.ID(), fs.WithEntity(targetEntity))  (L290)
+    ↓
+返回历史版本的文件内容
+```
+
+**结论**：读取时确实锁定了会话创建时指定的历史版本，返回的是该版本的实体内容。
+
+#### 4.6.2 回写时数据落在哪里
+
+**核心代码**：
+- PutContent：[viewer.go L212-L234](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/viewer.go#L212-L234)
+- FileUpdateService：[file.go L305-L308](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/file.go#L305-L308)
+
+**回写路径分析**：
+
+```go
+// PutContent 中使用的是 viewerSession.Uri（文件 URI），不是版本特定的 URI
+fileUri := viewerSession.Uri  // L212
+
+// 创建 FileUpdateService 时只设置了 Uri，Previous 为空
+subService := FileUpdateService{
+    Uri: fileUri,  // L233
+    // ❌ 没有设置 Previous，也没有使用 viewerSession.Version
+}
+
+// FileUpdateService 定义
+type FileUpdateService struct {
+    Uri      string `form:"uri" binding:"required"`
+    Previous string `form:"previous"`  // ← WOPI 路径下始终为空
+}
+```
+
+**回写流向**：
+```
+PutContent (viewer.go L158)
+    ↓
+fileUri = viewerSession.Uri  ← 文件 URI，指向文件本身，不是特定版本
+    ↓
+FileUpdateService{Uri: fileUri, Previous: ""}
+    ↓
+PutContent → m.Update (file.go L348)
+    ↓
+CreateEntity → 创建新的主实体（最新版本）
+    ↓
+✅ 写入到文件的最新版本（覆盖当前主实体）
+❌ **不会写入到读取的历史版本**
+```
+
+**关键代码证据** - `canEdit` 条件：
+```go
+// viewer.go L334
+canEdit := file.PrimaryEntityID() == targetEntity.ID()  // 必须是最新版本
+       && file.OwnerID() == user.ID                      // 必须是文件所有者
+       && uri.FileSystem() == constants.FileSystemMy     // 必须在"我的文件"中
+```
+
+**一致性问题总结**：
+
+| 阶段 | 操作的版本 | 说明 |
+|-----|-----------|------|
+| 会话创建 | `s.Version`（可能是历史版本） | 保存到 `ViewerSessionCache.Version` |
+| GetFile 读取 | `viewerSession.Version` 指定的历史版本 | 通过 `FindDesiredEntity` 找到历史实体 |
+| CheckFileInfo | 检查 `PrimaryEntityID() == targetEntity.ID()` | 历史版本时 `canEdit = false`，客户端只读 |
+| PutContent 回写 | **文件的最新版本**（主实体） | 使用 `viewerSession.Uri`，不区分版本 |
+
+**问题**：
+1. 如果打开的是历史版本，`canEdit = false`，客户端会显示只读
+2. 但如果客户端绕过这个限制（直接调用 PutContent API），回写会成功
+3. 回写会**覆盖最新版本**，而不是修改历史版本
+4. 用户编辑的是历史版本的内容，但保存后最新版本被覆盖，导致"打开历史版本编辑后内容不一致"
+
+#### 4.6.3 查看/编辑操作类型是否记录在会话中
+
+> **⚠️ 关键发现**：操作类型（查看/编辑）**只在链接生成阶段使用**，没有记录在会话状态中。
+
+**核心代码**：
+- 会话缓存定义：[manager/viewer.go L23-L31](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/filemanager/manager/viewer.go#L23-L31)
+- 请求参数：[viewer.go L369-L373](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/viewer.go#L369-L373)
+- WOPI 链接生成：[wopi.go L60-L85](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/wopi/wopi.go#L60-L85)
+
+**分析**：
+
+```go
+// 1. 请求参数中有 PreferredAction 字段
+type CreateViewerSessionService struct {
+    Uri             string               `json:"uri" form:"uri" binding:"required"`
+    Version         string               `json:"version" form:"version"`
+    ViewerID        string               `json:"viewer_id" form:"viewer_id" binding:"required"`
+    PreferredAction types.ViewerAction   `json:"preferred_action" form:"preferred_action" binding:"required"`
+    // ↑ 有这个字段，但只在生成链接时使用
+}
+
+// 2. 会话缓存中没有 Action 字段
+type ViewerSessionCache struct {
+    ID       string
+    Uri      string
+    UserID   int
+    FileID   int
+    ViewerID string
+    Version  string
+    Token    string
+    // ❌ 没有 Action 字段！
+}
+
+// 3. 调用 CreateViewerSession 时没有传递 action
+// viewer.go L409
+viewerSession, err := m.CreateViewerSession(c, uri, s.Version, targetViewer)
+// ↑ 只传了 version，没有传 s.PreferredAction
+
+// 4. PreferredAction 只在生成 WOPI 链接时使用
+// viewer.go L417
+wopiSrc, err := wopi.GenerateWopiSrc(c, s.PreferredAction, targetViewer, viewerSession)
+// ↑ 用于选择 WOPI 服务器的 URL 模板（embedview 或 edit）
+
+// 5. GenerateWopiSrc 中 action 的用途
+func GenerateWopiSrc(ctx context.Context, action types.ViewerAction, ...) (*url.URL, error) {
+    // 根据 action 选择可用的 WOPI 操作 URL
+    availableActions, ok := viewer.WopiActions[viewerSession.File.Ext()]
+    fallbackOrder := []types.ViewerAction{action, types.ViewerActionView, types.ViewerActionEdit}
+    for _, a := range fallbackOrder {
+        if src, ok = availableActions[a]; ok {
+            break
+        }
+    }
+    // 生成 WOPI 客户端 URL，不会修改会话
+}
+```
+
+**操作类型的生命周期**：
+```
+用户请求创建会话（携带 preferred_action=edit）
+    ↓
+CreateViewerSessionService 接收参数
+    ↓
+m.CreateViewerSession() → 创建会话（不保存 action）
+    ↓
+wopi.GenerateWopiSrc(preferred_action, ...) → 选择 WOPI URL 模板
+    ↓
+返回 WOPI src URL 给前端
+    ↓
+前端跳转到 WOPI 客户端（URL 决定是预览还是编辑模式）
+    ↓
+后续所有 WOPI 请求（CheckFileInfo/GetFile/PutFile）
+    ↓
+⚠️ 会话中没有 action 信息，无法区分是查看还是编辑操作
+```
+
+**影响**：
+1. 中间件 `WopiWriteAccess` 期望从会话中读取 `Action` 字段来区分编辑操作，但会话中根本没有这个字段
+2. 服务端无法通过会话判断当前是"查看"还是"编辑"模式
+3. 即使前端生成的是"预览"链接，用户仍然可以通过直接调用 API 进行写入
+4. 无法基于操作类型进行细粒度的权限控制或审计
+
 ---
 
 ## 5. 编辑冲突处理
