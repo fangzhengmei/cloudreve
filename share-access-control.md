@@ -471,3 +471,156 @@ func BuildShare(s *ent.Share, base *url.URL, hasher hashid.Encoder, requester *e
 | **第二层：密码校验** | 分享密码匹配（所有者免校验） | `service/share/visit.go` 和 `share_navigator.Root()` |
 | **第三层：用户组权限** | `GroupPermissionShareDownload`（下载/访问权限） | `share_navigator.Root()` |
 | **第四层：导航器 Capability** | 文件系统操作能力边界（下载、列表、缩略图等） | `shareNavigatorCapability` |
+
+---
+
+## 9. 边界细节深度分析
+
+### 9.1 密码错误时的锁定态展示
+
+当访问者输入错误密码（或未输入密码）时，前端会收到 `unlocked=false` 的响应。此时 `BuildShare()` 对字段做了三层可见性控制：
+
+位置：[service/explorer/response.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/explorer/response.go#L346-L414)
+
+| 字段分类 | 字段名 | `unlocked=false`（锁定）时 | `unlocked=true`（解锁）时 |
+|---------|--------|--------------------------|--------------------------|
+| **始终可见** | `Name`、`ID`、`Unlocked`、`Owner`、`Expired`、`Url`、`CreatedAt`、`Visited`、`SourceType`、`PasswordProtected` | ✅ 可见 | ✅ 可见 |
+| **解锁后可见** | `RemainDownloads`、`Downloaded`、`Expires`、`Password`、`ShowReadMe`、`Size` | ❌ 零值/空 | ✅ 真实值 |
+| **仅所有者可见** | `IsPrivate`、`ShareView` | ❌ 零值（所有者除外） | ✅ 真实值（仅所有者） |
+
+**URL 的差异化处理** 在 `BuildShareLink()` 中：
+位置：[service/explorer/response.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/explorer/response.go#L500-L506)
+
+```go
+func BuildShareLink(s *ent.Share, hasher hashid.Encoder, base *url.URL, unlocked bool) string {
+    shareId := hashid.EncodeShareID(hasher, s.ID)
+    if unlocked {
+        // 解锁状态：URL 中携带密码，形如 /s/{id}/{password}
+        return routes.MasterShareUrl(base, shareId, s.Password).String()
+    }
+    // 锁定状态：URL 中不携带密码，形如 /s/{id}
+    return routes.MasterShareUrl(base, shareId, "").String()
+}
+```
+
+**锁定态前端表现总结**：
+- 可以看到分享的文件名、所有者昵称、浏览次数
+- 知道这个分享是有密码保护的（`PasswordProtected=true`）
+- 不知道剩余下载次数、过期时间、文件大小
+- 返回的分享 URL 不包含密码片段，需要用户手动输入密码后才能访问内容
+
+---
+
+### 9.2 所有者查看来源路径时的密码要求
+
+所有者通过 `owner_extended=true` 参数获取分享对应的源文件路径（`SourceUri`）时，存在一个隐蔽的密码校验边界：
+
+位置：[service/share/visit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/visit.go#L93-L109)
+
+```go
+if s.OwnerExtended && share.Edges.User.ID == u.ID {
+    m := manager.NewFileManager(dep, u)
+    defer m.Recycle()
+
+    // 关键：用请求中传入的 s.Password 构造 share URI
+    shareUri, err := fs.NewUriFromString(fs.NewShareUri(res.ID, s.Password))
+    if err != nil {
+        return nil, serializer.NewError(serializer.CodeInternalSetting, "Invalid share url", err)
+    }
+
+    // 通过 FileManager.Get → share_navigator.Root() 路径访问
+    root, err := m.Get(c, shareUri)
+    if err != nil {
+        return nil, serializer.NewError(serializer.CodeNotFound, "File not found", err)
+    }
+
+    res.SourceUri = root.Uri(true).String()
+}
+```
+
+**两层密码校验的差异**：
+
+| 校验位置 | 所有者是否豁免 | 代码 |
+|---------|--------------|------|
+| `ShareInfoService.Get()` 第 85 行 | ✅ 所有者豁免，`unlocked` 始终为 true | `share.Edges.User.ID != u.ID` 作为判断条件之一 |
+| `share_navigator.Root()` 第 130 行 | ❌ **所有者也需要密码** | `share.Password != "" && share.Password != path.Password()` |
+
+**问题场景**：
+如果分享设置了密码，但所有者请求 `owner_extended=true` 时没有在请求参数里传 `password`，则：
+1. 第一层校验通过，`unlocked=true`，所有者能看到分享详情
+2. 但构造 `shareUri` 时 `s.Password` 为空，URI 中不包含密码
+3. 进入 `share_navigator.Root()` 时密码校验失败，返回 `ErrShareIncorrectPassword`
+4. 最终接口返回 `"File not found"`（第 105 行被包装为 `CodeNotFound`）
+
+**URI 密码注入逻辑** 在 [pkg/filemanager/fs/uri.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/uri.go#L357-L362)：
+
+```go
+func NewShareUri(id, password string) string {
+    if password != "" {
+        // cloudreve://{id}:{password}@share
+        return fmt.Sprintf("%s://%s:%s@%s", constants.CloudreveScheme, id, password, constants.FileSystemShare)
+    }
+    // cloudreve://{id}@share  （无密码）
+    return fmt.Sprintf("%s://%s@%s", constants.CloudreveScheme, id, constants.FileSystemShare)
+}
+```
+
+---
+
+### 9.3 失效判断（IsValidShare）和 过期判断（IsShareExpired）的区别
+
+两个函数的包含关系：`IsValidShare = IsShareExpired + 所有者状态检查 + 源文件状态检查`
+
+位置：[inventory/share.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/inventory/share.go#L227-L258)
+
+#### 函数定义对比
+
+```go
+// IsShareExpired：仅检查分享自身的两个过期属性
+func IsShareExpired(share *ent.Share) error {
+    if (share.Expires != nil && share.Expires.Before(time.Now())) ||
+        (share.RemainDownloads != nil && *share.RemainDownloads <= 0) {
+        return ErrShareLinkExpired   // "share link expired"
+    }
+    return nil
+}
+
+// IsValidShare：全面检查分享是否可访问
+func IsValidShare(share *ent.Share) error {
+    // 步骤 1：先检查过期
+    if err := IsShareExpired(share); err != nil {
+        return err                  // ErrShareLinkExpired
+    }
+    // 步骤 2：检查所有者状态
+    owner, err := share.Edges.UserOrErr()
+    if err != nil || owner.Status != user.StatusActive {
+        return ErrOwnerInactive      // "owner is inactive"
+    }
+    // 步骤 3：检查源文件有效性
+    file, err := share.Edges.FileOrErr()
+    if err != nil || file.FileChildren == 0 || file.OwnerID != owner.ID {
+        return ErrSourceFileInvalid  // "source file is deleted"
+    }
+    return nil
+}
+```
+
+#### 不同场景的使用差异
+
+| 调用位置 | 使用的函数 | 后果 |
+|---------|----------|------|
+| `ShareInfoService.Get()` 获取单个分享 | `IsValidShare` | 任何原因导致分享无效，直接返回 404 `"Share link expired"` |
+| `share_navigator.Root()` 文件系统导航 | `IsValidShare` | 任何原因导致分享无效，返回 `ErrShareNotFound` |
+| `BuildShare()` 构建响应的 `Expired` 字段 | `IsShareExpired \|\| expired` | 仅用于前端展示"已过期"标识，不会阻断访问 |
+| `BuildListShareResponse()` 列表中的 `expired` 参数 | `IsValidShare`（结果传入 BuildShare 的 expired 参数） | 列表中分享的过期标识基于完整有效性 |
+
+#### 设计意图分析
+
+1. **访问拦截用 IsValidShare**：获取分享内容、浏览文件系统等真正需要访问分享资源的操作，必须通过完整校验 —— 源文件被删、所有者被封号都应该阻断访问
+
+2. **展示标识分层处理**：
+   - `Expired` 字段在 `BuildShare()` 中同时看 `IsShareExpired()` 和传入的 `expired` 参数
+   - 在单分享查询时（`ShareInfoService.Get()`）传入 `expired=false`，所以 `Expired` 仅反映时间/下载次数耗尽
+   - 在列表查询时（`BuildListShareResponse()`）传入 `IsValidShare()` 的结果，所以列表中的 `Expired` 包含所有失效原因
+
+3. **错误码统一但语义不同**：`ShareInfoService.Get()` 中 `IsValidShare` 失败后统一返回 `"Share link expired"`（第 76 行），无论实际是时间过期、所有者被封还是源文件被删，对外都表现为"链接过期"，避免泄露内部状态信息
