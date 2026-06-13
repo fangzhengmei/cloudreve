@@ -38,9 +38,100 @@ type FileThumbResponse struct {
 
 ---
 
-## 二、预览地址生成
+## 二、从缩略图接口到图片数据的完整链路
 
-### 2.1 Manager 层的决策路径
+### 2.1 两阶段分离：URL 获取 vs 图片加载
+
+缩略图的完整消费过程分为**两个阶段**，由前端在不同的 HTTP 请求中完成：
+
+**阶段一 — 获取缩略图 URL**
+
+```
+前端 → GET /api/v3/file/thumb?uri=xxx
+    ↓
+路由注册: routers/router.go#L662
+    file.GET("thumb",
+        middleware.ContextHint(),
+        controllers.FromQuery[explorer.FileThumbService](...),
+        controllers.Thumb)
+    ↓
+控制器: routers/controllers/file.go#L147
+    service.Get(c) → FileThumbResponse{Url, Expires}
+    ↓
+前端收到: {"code":0,"data":{"url":"https://...","expires":"..."}}
+```
+
+此阶段只返回 URL 字符串和过期时间，**不返回图片二进制数据**。
+
+**阶段二 — 加载图片数据**
+
+前端拿到 URL 后，将其设为 `<img>` 标签的 `src`，浏览器发第二次请求加载图片。URL 的目标取决于阶段一生成的路径：
+
+| URL 形态 | 浏览器请求目标 | 数据来源 |
+|----------|-------------|---------|
+| 存储直链（模式 B） | 云存储签名 URL | OSS/COS/OBS/OneDrive 等直接返回 |
+| 内部代理 URL（模式 A） | `{SiteURL}/api/v3/file/content/{hashid}?thumb` | Cloudreve 反代到存储 |
+
+### 2.2 内部代理路径的详细流转
+
+当缩略图走内部代理模式时，图片数据的流转经过两层 HTTP 请求：
+
+```
+浏览器
+  │ GET /api/v3/file/content/{entityHashId}/0/{filename}?thumb
+  │ （签名参数在 query string 中）
+  ▼
+路由层: routers/router.go#L647
+  content.GET(":id/:speed/:name",
+      middleware.SignRequired(dep.GeneralAuth()),   ← 签名校验
+      middleware.HashID(hashid.EntityID),            ← hashid 解码
+      middleware.Sandbox(),                          ← 沙箱隔离
+      controllers.ServeEntity)
+  ▼
+控制器: routers/controllers/file.go#L177
+  EntityDownloadService.Serve(c)
+  ▼
+服务层: service/explorer/entity.go#L26
+  m.GetEntitySource(c, entityID)    ← 获取 EntitySource
+  entitySource.Serve(w, r,
+      WithThumb(isThumb),           ← 告知 EntitySource 这是缩略请求
+      WithContext(c))
+  ▼
+EntitySource.Serve(): entitysource.go#L270
+  ├─ IsLocal? → 直接从本地磁盘读取，写入 HTTP Response
+  └─ 非 Local? → Url() 获取存储直链 → ReverseProxy 反代
+```
+
+关键点：当浏览器通过内部代理 URL 加载缩略图时，`EntitySource.Serve()` 会再次调用 `Url()` 获取存储端的直链（此时不带 `IsThumb` 标志，因为实体已经是缩略图本身），然后通过 `httputil.ReverseProxy` 把请求反向代理到存储端。
+
+### 2.3 从节点的缩略图流转
+
+从节点（Slave）的缩略图走独立的 API 路径：
+
+```
+主节点请求从节点: GET /api/v3/slave/file/thumb/{base64src}/{ext}
+    ↓
+路由: routers/router.go#L92
+  file.GET("thumb/:src/:ext",
+      controllers.SlaveThumb)
+    ↓
+服务: service/explorer/slave.go#L157
+  SlaveThumbService.Thumb(c)
+    ├─ 尝试读取已有的本地 sidecar 缩略文件
+    │   local.NewLocalFileEntity(EntityTypeThumbnail, src+ThumbSlaveSidecarSuffix)
+    ├─ 不存在? → 从原文件生成
+    │   local.NewLocalFileEntity(EntityTypeVersion, src)
+    │   m.SubmitAndAwaitThumbnailTask(c, nil, ext, srcEntity)
+    └─ 获取 EntitySource → Serve() 直接写回 HTTP Response
+```
+
+与主节点的区别：从节点**直接把图片数据写入 HTTP 响应**，而非返回 JSON URL。
+
+---
+
+## 三、预览地址生成
+
+### 3.1 Manager 层的决策路径
 
 决策入口：[manager.Thumbnail()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/manager/thumbnail.go#L27-L101)
 
@@ -61,11 +152,11 @@ type FileThumbResponse struct {
 **第五层 — 兜底：永久标记不可用**
 - 若以上条件均不满足，则在文件元数据中写入 `ThumbDisabledKey`，后续请求在第一层就被拦截，避免重复尝试。
 
-### 2.2 EntitySource 层的 URL 路由
+### 3.2 EntitySource 层的 URL 路由
 
 URL 生成入口：[EntitySource.Url()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/manager/entitysource/entitysource.go#L587-L668)
 
-当 Manager 层返回 EntitySource 后，其 `Url()` 方法会根据两个概念决定具体 URL 形态：
+当 Manager 层返回 EntitySource 后，其 `Url()` 方法会根据条件决定具体 URL 形态：
 
 **模式 A — 内部代理模式（Cloudreve 反代）**
 触发条件（满足任一即可）：
@@ -74,7 +165,13 @@ URL 生成入口：[EntitySource.Url()](file:///d:/fz/0601-1/solo-dogfeeding/cod
 - 实体尚未落库（ID 为 0）
 - 实体已加密且调用方未显式关闭代理
 
-此模式下，URL 指向 Cloudreve 自身接口：`{SiteURL}/api/v3/file/content/{hashid}?...`，由 Cloudreve 再向底层存储拉取数据并回传给客户端。所有响应会经过签名与过期校验。
+此模式下，URL 由 [MasterFileContentUrl()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/cluster/routes/routes.go#L147-L166) 构造，格式为：
+
+```
+{SiteURL}/api/v3/file/content/{entityHashId}/{speedLimit}/{filename}?thumb
+```
+
+其中 `?thumb` 查询参数由 [IsThumbQuery](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/cluster/routes/routes.go#L16)（值 `"thumb"`）设置，告知后续的 `EntityDownloadService.Serve()` 这是缩略图请求。整个 URL 会被 `auth.SignURI()` 添加 HMAC 签名和过期时间。
 
 **模式 B — 存储直链模式**
 无需内部代理时，URL 直接由驱动生成：
@@ -83,7 +180,7 @@ URL 生成入口：[EntitySource.Url()](file:///d:/fz/0601-1/solo-dogfeeding/cod
 
 两种模式最终都会经过 `driver.ApplyProxyIfNeeded()`，用于叠加 CDN 域名或外部反代配置。
 
-### 2.3 原生缩略 URL 的生成细节
+### 3.3 原生缩略 URL 的生成细节
 
 当走模式 B + `IsThumb=true` 时，各驱动通过不同方式把"尺寸+编码"参数注入签名 URL：
 
@@ -101,11 +198,93 @@ URL 生成入口：[EntitySource.Url()](file:///d:/fz/0601-1/solo-dogfeeding/cod
 
 ---
 
-## 三、缓存策略
+## 四、出错时的返回与默认图片
+
+### 4.1 缩略图 API 的错误响应
+
+当 `GET /api/v3/file/thumb?uri=xxx` 请求失败时，后端始终返回 HTTP 200，在 JSON body 中用 `code` 字段区分成功与失败：
+
+**成功响应**：
+```json
+{"code":0,"data":{"url":"https://...","expires":"2026-06-13T10:00:00Z"}}
+```
+
+**失败响应**：
+```json
+{"code":40077,"msg":"Entity not exist","error":"failed to get thumbnail: ..."}
+```
+
+错误码来源于 [serializer.CodeEntityNotExist](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/serializer/error.go#L235) = 40077，由 `fs.ErrEntityNotExist` 产生。此错误在以下场景触发：
+- Manager 层预检发现 `ThumbDisabledKey`
+- Manager 层所有降级路径均不可用（第五层兜底）
+- 缩略图实体不存在且驱动不支持
+
+控制器层的处理逻辑：
+[controllers.Thumb()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/routers/controllers/file.go#L147-L157)
+
+```go
+func Thumb(c *gin.Context) {
+    res, err := service.Get(c)
+    if err != nil {
+        c.JSON(200, serializer.Err(c, err))  // 错误 → JSON 错误响应
+        c.Abort()
+        return
+    }
+    c.JSON(200, serializer.Response{Data: res})  // 成功 → JSON URL 响应
+}
+```
+
+### 4.2 前端无服务端默认图片
+
+**Cloudreve 后端不提供任何默认的缩略图占位图**。当缩略图 API 返回错误时：
+
+- 前端收到 `code != 0` 的 JSON 响应，知道缩略图不可用
+- 前端自行决定展示方式（通常使用本地的文件类型图标作为占位）
+- 不存在从后端加载 fallback 图片的机制
+
+这与社交分享场景形成对比——社交分享有专门的服务端兜底图片。
+
+### 4.3 内部代理路径中的错误
+
+当浏览器通过内部代理 URL 加载缩略图图片数据时，错误以 HTTP 状态码直接返回：
+
+[EntitySource.Serve()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/manager/entitysource/entitysource.go#L270-L384)
+
+| 场景 | HTTP 状态码 | 响应体 |
+|------|-----------|--------|
+| 本地实体数据不存在 | 404 | `"Entity data does not exist."` |
+| 非本地文件 URL 生成失败 | 500 | 错误信息字符串 |
+| 非本地文件 URL 解析失败 | 500 | 错误信息字符串 |
+| 反向代理到存储端失败 | 502 | `"[Cloudreve] Bad Gateway"` |
+| 文件 Seek 失败 | 500 | `"seeker can't seek"` |
+
+浏览器收到这些 HTTP 错误后，`<img>` 标签显示为破碎图标，前端可监听 `onerror` 事件做占位处理。
+
+### 4.4 社交分享的默认图片
+
+社交分享是唯一存在服务端默认图片的场景。当缩略图获取失败时，降级到 PWA 应用图标：
+
+[renderShareOGPage()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/middleware/share_preview.go#L129-L179)
+
+```
+优先使用 pwa.LargeIcon（PWA 大图标）
+    ↓ 不存在
+使用 pwa.MediumIcon（PWA 中等图标）
+    ↓ 缩略图获取成功
+覆盖为文件缩略图 URL
+    ↓ 缩略图获取失败
+继续使用 PWA 图标（静默降级，不报错）
+```
+
+默认图片的 URL 由 `resolveURL(base, pwa.LargeIcon)` 生成，其中 `base` 是站点 URL，`pwa.LargeIcon` 是管理后台配置的 PWA 图标路径。如果路径是相对路径，会基于站点 URL 补全为绝对 URL。
+
+---
+
+## 五、缓存策略
 
 缩略图系统的缓存设计横跨四个概念层次：
 
-### 3.1 持久化实体缓存
+### 5.1 持久化实体缓存
 
 缩略图一旦成功生成，就会作为 `EntityTypeThumbnail` 类型的实体被持久化存储，与原文件建立关联。后续请求直接复用该实体（Manager 层的第二层判定），不再重新计算。
 
@@ -113,7 +292,7 @@ URL 生成入口：[EntitySource.Url()](file:///d:/fz/0601-1/solo-dogfeeding/cod
 - **主节点模式**：缩略图通过 `m.Update()` 写入存储策略，保存路径由 `ThumbEntitySuffix` 模板决定
 - **从节点模式**（stateless）：缩略图作为 sidecar 文件写入源路径同目录，保存路径为 `原始路径 + ThumbSlaveSidecarSuffix`
 
-### 3.2 签名 URL 内存缓存
+### 5.2 签名 URL 内存缓存
 
 非本地驱动需要反复生成带签名的访问 URL。EntitySource 内部维护了对最近一次生成 URL 的内存缓存：
 
@@ -126,14 +305,14 @@ type entitySource struct {
 
 在读取远程资源时，若缓存 URL 距离过期还有至少 1 分钟余量，则直接复用；否则重新生成并刷新缓存。调用 `Apply()` 变更选项（会影响 URL 内容）时主动清理缓存。
 
-### 3.3 HTTP 条件请求缓存
+### 5.3 HTTP 条件请求缓存
 
 对本地驱动提供的文件，Serve 逻辑使用 ETag（由实体 ID 哈希生成）支持标准 HTTP 条件请求：
 - `If-None-Match` 命中时返回 `304 Not Modified`
 - `If-Match` 用于前置一致性校验
 - `If-Range` 与 `Range` 结合用于条件范围请求
 
-### 3.4 不可预览标记缓存
+### 5.4 不可预览标记缓存
 
 当缩略图生成失败或驱动明确不支持时，系统在文件元数据中写入 `ThumbDisabledKey`：
 
@@ -150,13 +329,13 @@ func disableThumb(ctx context.Context, m *manager, uri *fs.URI) error {
 
 ---
 
-## 四、驱动能力差异
+## 六、驱动能力差异
 
-### 4.1 能力模型
+### 6.1 能力模型
 
 所有缩略图相关能力由驱动的 `Capabilities()` 返回，核心字段定义：
 
-[driver/handler.go Capabilities](file:///d:/fz/0601-1\solo-dogfeeding\code\47-Cloudreve\pkg\filemanager\driver\handler.go#L89-L111)
+[driver/handler.go Capabilities](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/driver/handler.go#L89-L111)
 
 ```go
 type Capabilities struct {
@@ -170,7 +349,7 @@ type Capabilities struct {
 
 这些能力字段共同决定 Manager 层在第三层（原生）和第四层（代理）之间的路径选择。
 
-### 4.2 各驱动能力对照
+### 6.2 各驱动能力对照
 
 | 驱动 | 原生 Thumb 是否实现 | ThumbSupportedExts | ThumbProxy | 是否强制内部代理 |
 |------|--------------------|-------------------|------------|-----------------|
@@ -188,26 +367,11 @@ type Capabilities struct {
 **对 Local 驱动的特别说明**：
 由于 `ThumbSupportedExts=nil`、`ThumbSupportAllExts=false`，第三层（原生）的判定条件永远为假；而 `ThumbProxy=true` 导致它必然进入第四层（本地代理生成）。又因为 `HandlerCapabilityProxyRequired`，其最终输出的 URL 永远走内部代理模式，不会出现外部直链。
 
-**对 OneDrive 驱动的特别说明**：
-其 `Thumb()` 已完整实现，调用 Microsoft Graph API `GetThumbURL` 获取缩略图 URL。但 Graph API 本身对不支持的文件会返回错误，且该错误发生在 Manager 层决策之后，因此**不会触发降级回退到 `ThumbProxy`** 本地生成——错误会直接向上冒泡。详见 5.4 节的分析。
-
-**OneDrive 缩略图错误分类**：
-[onedrive.go#L139-L150](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/driver/onedrive/onedrive.go#L139-L150)
-
-OneDrive 的 `Thumb()` 方法对 Graph API 返回的错误做了明确分类：
-- **业务不可用错误**（可识别的"不支持"类）：
-  - `ErrThumbSizeNotFound`：Graph API 响应中不存在 `large` 尺寸的缩略图
-  - `itemNotFound`：文件/项在 OneDrive 中不存在
-  - 以上两种会被包装为 `fmt.Errorf("thumb not supported in OneDrive: %w", err)` 返回
-- **其他运行时错误**：网络错误、Token 过期、权限不足等，直接原样向上抛出
-
-但由于判定与执行是分离的，这些错误都无法触发 Manager 层的降级。
-
 ---
 
-## 五、降级处理
+## 七、降级处理
 
-### 5.1 请求链路的分级降级
+### 7.1 请求链路的分级降级
 
 缩略图请求的处理过程，本质上是一条从"最省资源"到"最耗资源"的分级降级链，由 Manager 层的 Thumbnail 方法串联：
 
@@ -223,7 +387,60 @@ OneDrive 的 `Thumb()` 方法对 Graph API 返回的错误做了明确分类：
 - **本地代理**：需下载原图、调外部进程（如 vips/ffmpeg）、上传结果，成本最高
 - **标记禁用**：当所有路径均不可行时，将失败结论持久化，避免后续重复消耗
 
-### 5.2 本地生成管线内部的责任链降级
+### 7.2 OneDrive 原生缩略图的降级缺口
+
+OneDrive 的缩略图处理存在一个**判定与执行分离**的架构问题，导致降级链在"驱动原生"这一环断裂。
+
+**问题根源**：Manager 层的决策（走第三层原生路径）仅依据静态 `Capabilities` 字段判断，而真正调用 Graph API 获取缩略图是在后续 `EntitySource.Url()` 中执行。这两个阶段在调用栈上是分离的。
+
+**判定阶段**（Manager 层 `Thumbnail()` 中）：
+- 检查 `ThumbSupportAllExts` / `ThumbSupportedExts` / `ThumbMaxSize` 等字段
+- 只要这些字段匹配，就判定为"原生支持"，返回 EntitySource
+- 此阶段**不**实际调用 Graph API
+
+**执行阶段**（`EntitySource.Url()` 中）：
+- 调用 `handler.Thumb()` → `client.GetThumbURL()`
+- 发起实际的 Graph API 请求 `/drive/root:/{path}:/thumbnails/0/large`
+- 此时才可能发生错误
+
+**OneDrive 缩略图错误分类**：
+[onedrive.go#L139-L150](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/driver/onedrive/onedrive.go#L139-L150)
+
+```go
+func (handler *Driver) Thumb(ctx context.Context, expire *time.Time, ext string, e fs.Entity) (string, error) {
+    res, err := handler.client.GetThumbURL(ctx, e.Source())
+    if err != nil {
+        var apiErr *RespError
+        if errors.As(err, &apiErr); err == ErrThumbSizeNotFound ||
+           (apiErr != nil && apiErr.APIError.Code == notFoundError) {
+            return "", fmt.Errorf("thumb not supported in OneDrive: %w", err)
+        }
+    }
+    return res, nil
+}
+```
+
+- **业务不可用错误**（可识别的"不支持"类）：
+  - `ErrThumbSizeNotFound`：Graph API 响应中不存在 `large` 尺寸的缩略图（[api.go#L460](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/pkg/filemanager/driver/onedrive/api.go#L460)）
+  - `itemNotFound`：文件/项在 OneDrive 中不存在
+  - 以上两种会被包装为 `fmt.Errorf("thumb not supported in OneDrive: %w", err)` 返回
+- **其他运行时错误**：网络错误、Token 过期、权限不足等，直接原样向上抛出
+
+**降级缺口**：
+```
+Manager.Thumbnail()               EntitySource.Url()
+      │                               │
+      ├─ 判定 Capabilities ✓           ├─ handler.Thumb() ✗
+      └─ 返回 EntitySource              └─ 错误向上冒泡
+         （已无法回头）                     （无法回退到 ThumbProxy）
+```
+
+错误发生时，调用栈已离开 Manager 层的决策逻辑，无法触发第三层 → 第四层的降级。这意味着：
+- 对 OneDrive 中 Graph API 不支持的文件，`FileThumbService.Get()` 会返回 `code=40077` 的错误
+- 前端收到错误后，不会获得任何缩略图 URL
+- 只有当策略配置 `ThumbProxy=true` 且 `ThumbSupportedExts` 不包含该扩展名时，才能避开此问题，走正常的代理生成路径
+
+### 7.3 本地生成管线内部的责任链降级
 
 当请求进入本地代理路径后，缩略图由 Pipeline 内的一组 Generator 按优先级责任链尝试：
 
@@ -247,7 +464,7 @@ OneDrive 的 `Thumb()` 方法对 Graph API 返回的错误做了明确分类：
 
 中间结果的清理函数（`Result.Cleanup`）通过 `defer` 注册，在管线结束后执行临时目录/文件清理。
 
-### 5.3 生成失败后的处理
+### 7.4 生成失败后的处理
 
 当整条管线最终返回错误时：
 
@@ -257,7 +474,7 @@ OneDrive 的 `Thumb()` 方法对 Graph API 返回的错误做了明确分类：
 - 若错误不是上下文取消、且当前节点不是从节点（stateless），则把该文件标记为永久不可预览（写入 `ThumbDisabledKey`）
 - 从节点不做永久标记，因为文件可能在主节点重新生成
 
-### 5.4 Generator 内部的平台与场景降级
+### 7.5 Generator 内部的平台与场景降级
 
 在单个 Generator 内部，也存在针对运行环境和输入条件的降级分支：
 
@@ -275,32 +492,181 @@ OneDrive 的 `Thumb()` 方法对 Graph API 返回的错误做了明确分类：
 
 ---
 
-## 六、端到端数据流
+## 八、社交分享预览入口
+
+社交媒体分享时（如微信、Twitter、Facebook、Discord 等），爬虫会抓取页面的 Open Graph 元标签来生成卡片预览。Cloudreve 对此提供了专门的中间件链路，复用了现有的缩略图系统。
+
+### 8.1 爬虫识别与 OG 页面渲染
+
+入口中间件：[SharePreview](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/middleware/share_preview.go#L84-L103)
+
+```go
+func SharePreview(dep dependency.Dep) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        if !isSocialMediaBot(c.GetHeader("User-Agent")) {
+            c.Next()  // 非爬虫 → 正常走后续路由
+            return
+        }
+        // 爬虫 → 渲染 OG 页面并返回
+        id, password := extractShareParams(c)
+        html := renderShareOGPage(c, dep, id, password)
+        c.String(200, html)
+        c.Abort()  // 中止后续路由
+    }
+}
+```
+
+**爬虫识别**：通过 User-Agent 关键字匹配：
+- `facebookexternalhit`、`facebot`（Facebook / Messenger）
+- `twitterbot`（Twitter / X）
+- `linkedinbot`（LinkedIn）
+- `discordbot`（Discord）
+- `telegrambot`（Telegram）
+- `slackbot`（Slack）
+- `whatsapp`（WhatsApp）
+
+识别到爬虫后，不走正常的前端重定向逻辑，而是返回一个包含 Open Graph / Twitter Card 元标签的 HTML 页面。
+
+### 8.2 OG 页面结构与缩略图注入
+
+OG 页面模板：[ogHTMLTemplate](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/middleware/share_preview.go#L37-L57)
+
+```html
+<!DOCTYPE html>
+<html>
+<head>
+    <meta property="og:title" content="{{.Title}}">
+    <meta property="og:description" content="{{.Description}}">
+    <meta property="og:image" content="{{.ImageURL}}">
+    <meta property="og:url" content="{{.ShareURL}}">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary">
+    <meta name="twitter:image" content="{{.ImageURL}}">
+    ...
+</head>
+<body>
+    <script>window.location.href = "{{.RedirectURL}}";</script>
+</body>
+</html>
+```
+
+- `og:image` / `twitter:image`：卡片预览图，即缩略图 URL
+- `og:title`：文件名
+- `og:description`：文件大小 + 上传者昵称
+- `<script>` 标签：真实用户点击链接时重定向到前端页面
+
+### 8.3 缩略图逻辑的复用
+
+社交分享的缩略图完全复用现有的 `FileThumbService` 逻辑，入口：
+
+[loadShareThumbnail()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/middleware/share_preview.go#L181-L201)
+
+```go
+func loadShareThumbnail(c *gin.Context, shareID, password string, shareInfo *explorer.Share) (string, error) {
+    shareUri, err := fs.NewUriFromString(fs.NewShareUri(shareID, password))
+    subService := &explorer.FileThumbService{
+        Uri: shareUri.Join(shareInfo.Name).String(),
+    }
+    if err := SetUserCtx(c, 0); err != nil {
+        return "", err
+    }
+    res, err := subService.Get(c)
+    return res.Url, nil
+}
+```
+
+**上下文构造**：
+- 通过 `fs.NewShareUri()` 构造分享专属 URI（格式：`share://{id}/{password}`）
+- 通过 `SetUserCtx(c, 0)` 注入匿名（访客）用户身份，因为爬虫不会携带登录态
+- 调用与登录用户完全相同的 `FileThumbService.Get()` 方法
+
+### 8.4 社交分享的降级路径
+
+社交分享场景下的缩略图有四层降级：
 
 ```
-前端 → GET /api/v3/file/thumb?uri=xxx
-  ↓
-FileThumbService.Get()
-  ↓ manager.Thumbnail(uri)
-  │
-  ├─ [预检] ThumbDisabledKey? → 失败
-  ├─ [复用] 已有缩略图实体?    → GetEntitySource → Url()
-  ├─ [原生] 驱动支持且大小/扩展名匹配?
-  │     → GetEntitySource(WithUseThumb=true)
-  │     → EntitySource.Url()
-  │        ├─ ProxyRequired / 加密 / 策略代理?
-  │        │   → Cloudreve 内部代理 URL（模式 A）
-  │        └─ 否则
-  │            → handler.Thumb() 生成存储侧缩略 URL（模式 B）
-  │            → ApplyProxyIfNeeded 叠加 CDN/反代
-  ├─ [代理] ThumbProxy + 有 GenerateThumb 权限?
-  │     → SubmitAndAwaitThumbnailTask
-  │        → pipeline.Generate()
-  │           ├─ LibreOffice/MusicCover/LibRaw 提取中间结果
-  │           ├─ Vips/FFmpeg/Builtin 生成最终缩略
-  │        → 上传为缩略图实体
-  │        → GetEntitySource → Url()
-  └─ [兜底] 以上均不满足 → disableThumb → 失败
-  ↓
-FileThumbResponse{Url, Expires}
+已生成缩略图实体? → 使用文件缩略图 URL
+          ↓
+驱动原生支持? → 生成原生缩略 URL
+          ↓
+本地代理生成? → 生成并上传 → 使用
+          ↓
+获取缩略图失败? → 静默降级到 PWA 图标作为默认 og:image
+```
+
+前三层与普通缩略图逻辑完全一致，**社交分享特有的兜底**在：
+
+[renderShareOGPage()](file:///d:/fz/0601-1/solo-dogfeeding/code/47-Cloudreve/middleware/share_preview.go#L129-L179)
+
+```go
+if pwa.LargeIcon != "" {
+    data.ImageURL = resolveURL(base, pwa.LargeIcon)
+} else if pwa.MediumIcon != "" {
+    data.ImageURL = resolveURL(base, pwa.MediumIcon)
+}
+
+thumbnail, err := loadShareThumbnail(c, id, password, shareInfo)
+if err == nil {
+    data.ImageURL = thumbnail
+}
+```
+
+**与普通缩略图的不同**：普通缩略图失败时返回 `code=40077` 的 API 错误；而社交分享失败时**静默降级**到 PWA 应用图标，保证 OG 页面始终有一张图可供爬虫抓取。**这是整个系统中唯一存在服务端默认图片的场景**——普通文件预览没有后端提供的默认占位图。
+
+### 8.5 社交分享与普通预览的调用对比
+
+| 维度 | 普通文件预览 | 社交分享预览 |
+|------|------------|------------|
+| 入口 | `/api/v3/file/thumb` | 中间件识别爬虫 UA |
+| 用户身份 | 当前登录用户 | 匿名访客（UID=0） |
+| URI 类型 | 普通文件 URI | Share URI（含ID和密码） |
+| 缩略图逻辑 | `FileThumbService.Get()` | 完全复用 `FileThumbService.Get()` |
+| 失败处理 | 返回 API 错误（code=40077） | 降级到 PWA 图标，静默处理 |
+| 输出格式 | JSON（URL + Expires） | HTML（含 og:image 元标签） |
+| URL 过期策略 | 可配置 | 与普通预览相同 |
+| 是否有默认图片 | 否（前端自行处理） | 是（PWA 图标） |
+
+---
+
+## 九、全景调用关系总结
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  外部触发                                                            │
+│  ├─ 前端: GET /api/v3/file/thumb?uri=xxx (阶段一：获取 URL)         │
+│  ├─ 浏览器: GET {thumbUrl} (阶段二：加载图片数据)                    │
+│  └─ 社交爬虫: GET /s/{id}/{pwd} (UA 含 facebookexternalhit 等)     │
+└──────────────────────────────────────┬─────────────────────────────┘
+                                       │
+                    ┌──────────────────┴──────────────────┐
+                    │                                      │
+                    ▼                                      ▼
+    ┌─────────────────────────────┐      ┌─────────────────────────────┐
+    │  普通预览 / 内部代理加载      │      │  社交分享预览               │
+    │  FileThumbService.Get()     │      │  SharePreview 中间件         │
+    │  → JSON{Url, Expires}       │      │  → 识别爬虫 UA              │
+    │                             │      │  → 复用 FileThumbService    │
+    │  或 EntityDownloadService   │      │  → 失败降级到 PWA 图标      │
+    │  .Serve()                   │      │  → HTML OG 页面             │
+    │  → 图片二进制数据            │      └─────────────────────────────┘
+    └──────────────┬──────────────┘
+                   │
+                   ▼
+    ┌────────────────────────────────────┐
+    │  manager.Thumbnail() 决策链         │
+    │  [预检] → [复用] → [原生] → [代理] │
+    └───────────────────┬────────────────┘
+                        │
+    ┌───────────────────┴────────────────┐
+    │                                      │
+    ▼                                      ▼
+┌─────────────────────┐      ┌─────────────────────┐
+│ EntitySource.Url()  │      │ pipeline.Generate() │
+│ ├─ 模式 A: 内部代理 │      │ Generator 责任链     │
+│ │  /api/v3/file/    │      │  (6 个 Generator)   │
+│ │   content/{id}    │      └───────────┬─────────┘
+│ └─ 模式 B: 存储直链 │                  │
+│   handler.Thumb()   │                  ▼
+│   → 签名 URL        │      上传为缩略图实体
+└─────────────────────┘      → 再次走 Url() 生成访问地址
 ```
