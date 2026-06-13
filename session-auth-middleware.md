@@ -879,7 +879,370 @@ func ProcessCallback(c *gin.Context) error {
 
 ---
 
-## 八、匿名用户机制深度解析 — 为什么空 Authorization 不尝试从 Session 恢复身份
+## 八、回调地址中的 key/secret 鉴权机制深度解析
+
+这是之前文档未覆盖的关键环节。回调 URL 格式为 `callback/{policyType}/{sessionID}/{key}`，其中 `{key}` 就是 `CallbackSecret`，但它在不同存储类型的回调链路中的作用和校验方式截然不同。
+
+### 8.1 CallbackSecret 的生成
+
+CallbackSecret 是在 Master 侧创建 UploadSession 时生成的随机字符串，位于 [dbfs/upload.go#L250](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L250)：
+
+```go
+session := &fs.UploadSession{
+    // ... 其他字段 ...
+    UID:              f.user.ID,
+    Policy:           policy,
+    CallbackSecret:   util.RandStringRunesCrypto(32),  // ★ 32位加密安全随机字符串
+    LockToken:        lockToken,
+}
+```
+
+**生成函数** `util.RandStringRunesCrypto` 使用 `crypto/rand` 标准库，确保不可预测性。
+
+### 8.2 CallbackSecret 纳入回调 URL
+
+回调 URL 通过 `MasterSlaveCallbackUrl()` 生成，位于 [routes.go#L46-L49](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/cluster/routes/routes.go#L46-L49)：
+
+```go
+func MasterSlaveCallbackUrl(base *url.URL, driver, id, secret string) *url.URL {
+    // 路径拼接：/api/v4/callback/{driver}/{sessionID}/{CallbackSecret}
+    apiBaseURI, _ := url.Parse(path.Join(constants.APIPrefix+"/callback", driver, id, secret))
+    return base.ResolveReference(apiBaseURI)
+}
+```
+
+**生成时机**：在各存储驱动的 `Token()` 方法中调用：
+
+| 存储类型 | 生成位置 | 生成代码 |
+|---------|---------|---------|
+| Remote/从机 | [remote.go#L142](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/remote/remote.go#L142) | `routes.MasterSlaveCallbackUrl(siteURL, PolicyTypeRemote, uploadSessionID, CallbackSecret)` |
+| OSS | [oss.go#L265](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/oss/oss.go#L265) | `routes.MasterSlaveCallbackUrl(siteURL, PolicyTypeOss, uploadSessionID, CallbackSecret)` |
+| Qiniu | [qiniu.go#L366](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/qiniu/qiniu.go#L366) | `routes.MasterSlaveCallbackUrl(siteURL, PolicyTypeQiniu, uploadSessionID, CallbackSecret)` |
+| Upyun | [upyun.go#L287](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L287) | `routes.MasterSlaveCallbackUrl(siteURL, PolicyTypeUpyun, uploadSessionID, CallbackSecret)` |
+| S3 | [s3.go#L345](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/s3/s3.go#L345) | `routes.MasterSlaveCallbackUrl(siteURL, PolicyTypeS3, uploadSessionID, CallbackSecret)` |
+| OneDrive/COS/KS3/OBS | 各驱动 Token() 方法 | 类似模式 |
+
+生成的 URL 被存入 `uploadSession.Callback` 字段，然后：
+- **Remote 场景**：通过 RPC 传给 Slave 节点，Slave 在上传完成后发起回调
+- **第三方存储场景（OSS/Qiniu/Upyun 等）**：作为回调 URL 配置给第三方存储服务商，由服务商在上传完成后发起回调
+
+### 8.3 关键发现：`uploadCallbackCheck` 不校验 URL 中的 `:key`
+
+位于 [middleware/auth.go#L192-L217](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/auth.go#L192-L217) 的核心校验函数：
+
+```go
+func uploadCallbackCheck(c *gin.Context, policyType types.PolicyType) error {
+    // 步骤1：只读取 sessionID，完全不读取 :key
+    sessionID := c.Param("sessionID")   // ✅ 读取
+    // ❗ c.Param("key") 从未被读取 ❗
+
+    // 步骤2：只通过 sessionID 从 KV 读取 UploadSession
+    callbackSessionRaw, exist := dep.KV().Get("callback_" + sessionID)
+    if !exist {
+        return serializer.NewError(serializer.CodeUploadSessionExpired, ...)
+    }
+
+    // 步骤3：类型断言 + 策略类型校验
+    callbackSession := callbackSessionRaw.(fs.UploadSession)
+    if callbackSession.Policy.Type != string(policyType) {
+        return serializer.NewError(serializer.CodePolicyNotAllowed, "", nil)
+    }
+
+    // 步骤4：注入用户上下文
+    if err := SetUserCtx(c, callbackSession.UID); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+
+**惊人的事实**：URL 路径中的 `:key`（即 `CallbackSecret`）在 `UseUploadSession` 中**从未被读取，也从未与 `UploadSession.CallbackSecret` 进行比较**。这意味着：
+
+1. 攻击者如果能猜到 `sessionID`（UUID v4，实际上不可猜），则 URL 中的 `:key` 可以是任意值
+2. CallbackSecret 的安全作用**不在显式校验**，而在**其他机制**中
+
+### 8.4 不同存储类型回调链路中 key/secret 的校验方式对比
+
+回调 URL 格式统一为 `callback/{policyType}/{sessionID}/{key}`，但 7 种存储类型的校验强度差异巨大：
+
+| 存储类型 | 中间件链 | key/secret 的作用 | 校验方式 | 安全强度 |
+|---------|---------|-----------------|---------|---------|
+| **Remote/从机** | `UseUploadSession` → `RemoteCallbackAuth` → `ProcessCallback` | **间接纳入 HMAC 签名** | ✅ URL Path（包含 CallbackSecret）作为 HMAC 签名的一部分；HMAC 验签通过即证明 URL 未被篡改 | 🔒🔒🔒🔒🔒 最高 |
+| **OSS 阿里云** | `UseUploadSession` → `OSSCallbackAuth` → `OSSCallbackValidate` → `ProcessCallback` | **间接纳入阿里云回调签名** | ✅ 阿里云 SDK 验签 `oss.VerifyCallbackSignature`，签名包含 URL Path（含 CallbackSecret）；额外校验上传文件大小 | 🔒🔒🔒🔒 高 |
+| **Qiniu 七牛** | `UseUploadSession` → `QiniuCallbackValidate` → `ProcessCallback` | **间接纳入七牛回调签名** | ✅ 七牛 SDK 验签 `mac.VerifyCallback`，签名包含 URL Path（含 CallbackSecret） | 🔒🔒🔒🔒 高 |
+| **Upyun 又拍云** | `UseUploadSession` → `UpyunCallbackAuth` → `ProcessCallback` | **间接纳入又拍云回调签名** | ✅ 又拍云专有算法 `upyun.ValidateCallback`，签名包含 URL Path（含 CallbackSecret）、MD5、Date | 🔒🔒🔒🔒 高 |
+| **OneDrive** | `UseUploadSession` → `ProcessCallback` | **仅作为 URL 标识，不校验** | ❌ 无额外签名校验；key 仅作为路径的一部分，不可枚举性提供最低限度防护 | 🔒 最低 |
+| **COS/S3/KS3/OBS** | `UseUploadSession` → `ProcessCallback` | **仅作为 URL 标识，不校验** | ❌ 无额外签名校验；key 仅作为路径的一部分 | 🔒 最低 |
+
+### 8.5 Remote 场景：CallbackSecret 间接纳入 HMAC 验签的完整链路
+
+这是最复杂也最安全的场景，CallbackSecret 虽然不被显式比较，但通过 HMAC 签名机制被间接校验：
+
+**阶段一：Master 侧生成回调 URL 和签名密钥**
+```
+Master 侧 PrepareUpload
+    │
+    ├─► 生成 CallbackSecret = "a1b2c3..." (32位随机)
+    ├─► 生成回调 URL = "https://master.example.com/api/v4/callback/remote/sess-123/a1b2c3..."
+    ├─► UploadSession { CallbackSecret: "a1b2c3...", Callback: URL, Policy: {Node: {SlaveKey: "slave-secret-456"}} }
+    ├─► 存入 KV: "callback_sess-123" → UploadSession
+    └─► 通过 RPC 将 UploadSession 传给 Slave 节点
+```
+
+**阶段二：Slave 侧上传完成，发起回调请求**（[local.go#L264-L277](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/local/local.go#L264-L277)）
+
+```go
+// Slave 侧 local.Driver.CompleteUpload()
+func (handler *Driver) CompleteUpload(ctx context.Context, session *fs.UploadSession) error {
+    // session.Callback = "https://master.example.com/api/v4/callback/remote/sess-123/a1b2c3..."
+    resp := handler.httpClient.Request(
+        "POST",
+        session.Callback,       // ★ URL 包含 CallbackSecret
+        nil,
+        request.WithTimeout(...),
+        request.WithCredential(
+            auth.HMACAuth{[]byte(session.Policy.Edges.Node.SlaveKey)},  // ★ HMAC 密钥 = SlaveKey
+            int64(handler.config.Slave().SignatureTTL),
+        ),
+        // ...
+    )
+}
+```
+
+`request.WithCredential` 最终调用 `auth.SignRequest()` 对请求进行签名（[auth.go#L46-L122](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/auth/auth.go#L46-L122)）：
+
+```go
+func SignRequest(ctx context.Context, instance Auth, r *http.Request, expire *time.Time) *http.Request {
+    r.Header.Set(AuthorizationHeader, TokenHeaderPrefixCr+
+        instance.Sign(
+            getUrlSignContent(ctx, r.URL)+   // ★ 1. URL Path: "/api/v4/callback/remote/sess-123/a1b2c3..."
+            serializer.NewRequestSignString(r)+ // ★ 2. X-Cr-* Header
+            string(body),                        // ★ 3. Body
+            expire.Unix(),
+        ),
+    )
+    return r
+}
+```
+
+**关键**：URL Path 包含 CallbackSecret，因此签名内容 = `"/api/v4/callback/remote/sess-123/a1b2c3..." + Headers + Body`。
+
+**阶段三：Master 侧验签**（[auth.go#L219-L240](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/auth.go#L219-L240) → [auth.go#L60-L93](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/auth/auth.go#L60-L93)）
+
+```go
+// Master 侧 RemoteCallbackAuth()
+func RemoteCallbackAuth() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        session := c.MustGet(manager.UploadSessionCtx).(*fs.UploadSession)
+        authInstance := auth.HMACAuth{SecretKey: []byte(session.Policy.Edges.Node.SlaveKey)}
+
+        // auth.CheckRequest 内部：
+        // 1. 从请求 Header 取出签名
+        // 2. 按相同规则计算本地签名：
+        //    body = getUrlSignContent(c, c.Request.URL) +  // "/api/v4/callback/remote/sess-123/a1b2c3..."
+        //           X-Cr-* Headers + Body
+        // 3. HMACAuth.Check(body, sign) → 恒时比较
+        err := auth.CheckRequest(c, authInstance, c.Request)
+        // ...
+    }
+}
+```
+
+**校验逻辑链**：
+1. Slave 发起的请求 URL 为 `POST /api/v4/callback/remote/sess-123/a1b2c3...`，包含 CallbackSecret
+2. Master 侧 HMAC 验签时，会重新计算签名，**签名内容包含完整 URL Path**
+3. 如果攻击者篡改了 URL 中的 `:key`（如改成 `x9y8z7...`），则 Master 计算签名时使用的 Path 是 `/api/v4/callback/remote/sess-123/x9y8z7...`
+4. 而 Slave 签名时 Path 是 `/api/v4/callback/remote/sess-123/a1b2c3...`
+5. 签名内容不同 → HMAC 结果不同 → 验签失败
+
+**结论**：在 Remote 场景中，CallbackSecret **通过 HMAC 签名机制被间接校验**，无需显式比较 `c.Param("key") == session.CallbackSecret`。
+
+### 8.6 第三方存储场景：CallbackSecret 纳入服务商签名机制
+
+OSS、Qiniu、Upyun 等第三方存储的回调签名机制不由 Cloudreve 控制，但原理类似：
+
+```
+第三方存储服务商回调时：
+    1. 使用 Cloudreve 配置给它的 AccessKey/SecretKey 对回调请求进行签名
+    2. 签名内容通常包含：HTTP Method + URL Path + Body + 其他元数据
+    3. URL Path 中包含 CallbackSecret
+    4. Master 侧使用对应 SDK 的 VerifyCallback 方法验签
+    5. 验签通过即证明 URL（含 CallbackSecret）未被篡改
+```
+
+**OSS 验签**（[auth.go#L243-L259](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/auth.go#L243-L259) + [callback.go#L56-L77](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/routers/controllers/callback.go#L56-L77)）：
+```go
+// OSSCallbackAuth: 阿里云 SDK 验签（含 URL Path）
+func OSSCallbackAuth() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        err := oss.VerifyCallbackSignature(c.Request, dep.KV(), ...)
+        // ...
+    }
+}
+
+// OSSCallbackValidate: 额外校验文件大小（防篡改）
+func OSSCallbackValidate(c *gin.Context) {
+    uploadSession := c.MustGet(manager.UploadSessionCtx).(*fs.UploadSession)
+    if uploadSession.Props.Size != callbackBody.Size {
+        // 拒绝
+    }
+}
+```
+
+**Qiniu 验签**（[callback.go#L34-L54](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/routers/controllers/callback.go#L34-L54)）：
+```go
+func QiniuCallbackValidate(c *gin.Context) {
+    session := c.MustGet(manager.UploadSessionCtx).(*fs.UploadSession)
+    mac := qbox.NewMac(session.Policy.AccessKey, session.Policy.SecretKey)
+    ok, err := mac.VerifyCallback(c.Request)  // 七牛 SDK 内部校验签名（含 URL Path）
+    // ...
+}
+```
+
+**Upyun 验签**（[callback.go#L79-L90](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/routers/controllers/callback.go#L79-L90) + [upyun.go#L356-L384](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L356-L384)）：
+```go
+func UpyunCallbackAuth(c *gin.Context) {
+    uploadSession := c.MustGet(manager.UploadSessionCtx).(*fs.UploadSession)
+    err := upyun.ValidateCallback(c, uploadSession)
+    // 内部校验:
+    // 1. MD5(body) == Header["Content-Md5"]
+    // 2. 签名 = sign(AccessKey, SecretKey, ["POST", URL.Path, Date, ContentMD5])
+    // 3. 签名 == Header["Authorization"]
+}
+```
+
+### 8.7 OneDrive/COS/S3/KS3/OBS 场景：CallbackSecret 仅作标识
+
+这 5 种存储的回调链路**没有额外签名校验**，中间件链只有：
+```
+UseUploadSession → ProcessCallback
+```
+
+**安全保障**：
+- CallbackSecret 是 32 位加密安全随机字符串，作为 URL 路径的一部分，具有不可枚举性
+- sessionID 也是 UUID v4，同样不可枚举
+- 两者结合形成 64+ 位的随机路径，暴力枚举在计算上不可行
+- UploadSession 在 KV 中有 TTL（默认等于上传会话有效期），过期后自动删除
+
+**潜在风险**：
+- 如果攻击者通过其他方式获取了完整的回调 URL（如日志泄露），则可以在有效期内伪造回调
+- 但即使成功，攻击者也无法控制回调中的文件大小、哈希等元数据（由 Master 在会话创建时确定）
+
+### 8.8 CallbackSecret 还会返回给前端
+
+在 [response.go#L162](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/service/explorer/response.go#L162) 和 [response.go#L179](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/service/explorer/response.go#L179) 中：
+
+```go
+type UploadSessionResponse struct {
+    // ... 其他字段 ...
+    CallbackSecret  string  `json:"callback_secret"`  // ★ 返回给前端
+}
+
+func BuildUploadSessionResponse(...) *UploadSessionResponse {
+    return &UploadSessionResponse{
+        // ...
+        CallbackSecret:  session.CallbackSecret,  // 直接透传
+    }
+}
+```
+
+**设计意图**：某些存储的客户端 SDK（如分片上传、断点续传）需要知道完整的回调地址来完成上传流程。CallbackSecret 对前端是可见的，但这不是安全问题，因为：
+1. 前端本来就是上传的发起者，知道自己的回调密钥是合理的
+2. 回调的真正安全保障来自签名机制（Remote/HMAC、第三方存储签名），而非 CallbackSecret 的保密性
+
+---
+
+## 九、CallbackSecret、HMAC 签名、UploadSession 的安全职责划分
+
+三者形成了**分层防御**的安全架构，各自承担不可替代的职责：
+
+### 9.1 三者的安全职责对比表
+
+| 安全组件 | 核心职责 | 攻击面防护 | 不可伪造性来源 | 被破解后的影响 |
+|---------|---------|-----------|---------------|---------------|
+| **CallbackSecret** | 1. URL 路径不可枚举<br>2. 间接纳入签名内容（作为 URL Path 的一部分）<br>3. 前端 SDK 构造完整回调地址 | 暴力枚举、路径遍历 | `crypto/rand` 生成 32 位随机字符串 | 攻击者可以构造回调 URL，但需要同时破解签名才能通过验签 |
+| **HMAC 签名** | 1. 请求完整性校验（URL、Header、Body 未被篡改）<br>2. 身份认证（请求来自合法的 Slave 节点或第三方存储）<br>3. 时效性校验（签名过期时间） | 篡改请求、重放攻击、伪造请求 | `HMAC-SHA256` + `SlaveKey`（对称密钥）或第三方存储的 SecretKey + 恒时比较 | 攻击者可以篡改任何请求内容（包括 UID、文件大小等），以任意用户身份完成上传 |
+| **UploadSession** | 1. 会话状态存储（UID、Policy、文件大小、过期时间）<br>2. 跨请求上下文传递（将上传发起者的身份传递给回调 Handler）<br>3. 绑定签名密钥（Policy.Edges.Node.SlaveKey） | 会话劫持、状态篡改 | Master 侧 KV 存储，服务端独占，不暴露给客户端 | 攻击者可以冒充任何上传会话，以任意用户身份完成任意大小文件的上传 |
+
+### 9.2 分层防御架构图示
+
+```
+                                 ┌─────────────────────────────────────────────────┐
+                                 │             HTTP Request to Callback            │
+                                 │  POST /api/v4/callback/remote/sess-123/a1b2c3   │
+                                 │  Authorization: Bearer Cr <hmac_signature>       │
+                                 │  Body: { ... }                                   │
+                                 └──────────────────────┬──────────────────────────┘
+                                                        │
+                     ┌──────────────────────────────────┼──────────────────────────────────┐
+                     │                                  │                                  │
+         ┌───────────▼──────────┐            ┌──────────▼──────────┐            ┌────────▼──────────┐
+         │  第一层：URL 可寻址  │            │  第二层：完整性校验  │            │  第三层：状态绑定  │
+         │  CallbackSecret      │            │  HMAC 签名          │            │  UploadSession     │
+         │                      │            │                      │            │                    │
+         │ • 32位加密随机字符串 │            │ • HMAC-SHA256        │            │ • Master 侧 KV 存储│
+         │ • 作为 URL Path 的  │            │ • 恒时比较防时序攻击 │            │ • 存储 UID、Policy、│
+         │   一部分，防暴力枚举 │            │ • 签名内容包含：     │            │   文件大小、过期时 │
+         │ • 间接纳入签名内容   │            │   Path + Header + Body│           │   间等关键状态      │
+         │                      │            │ • 过期时间戳防重放   │            │ • 提供签名密钥来源 │
+         └───────────┬──────────┘            └──────────┬──────────┘            └──────────┬──────────┘
+                     │                                  │                                  │
+                     ▼                                  ▼                                  ▼
+         攻击者无法通过       ⇒          攻击者无法篡改请求       ⇒          即使通过前两层，上
+         枚举找到有效 URL                内容（包括 UID、文件          传的 UID、大小等状态
+                                       大小），也无法伪造有效          已在 Master 侧绑定，
+                                       签名                              不可篡改
+```
+
+### 9.3 三者的协作流程（Remote 场景）
+
+```
+1. 上传准备阶段（Master 侧）：
+   ┌─ 生成 UploadSession { UID: 12345, CallbackSecret: rand(32), Policy: {Node: {SlaveKey: "abc"}} }
+   ├─ 生成回调 URL（包含 CallbackSecret）
+   ├─ 存入 KV
+   └─ RPC 传给 Slave
+
+2. 签名阶段（Slave 侧）：
+   ┌─ 上传完成，读取 UploadSession.Callback（含 CallbackSecret）
+   ├─ 用 SlaveKey 对 "URL Path + Header + Body" 进行 HMAC 签名
+   └─ 发送请求给 Master
+
+3. 验签阶段（Master 侧）：
+   ┌─ UseUploadSession: 通过 sessionID 从 KV 读取 UploadSession
+   │                       （包含正确的 UID、SlaveKey、文件大小等）
+   ├─ RemoteCallbackAuth: 用 UploadSession.Policy.Node.SlaveKey 验签
+   │                       重新计算签名时 URL Path 包含 CallbackSecret
+   │                       → 验证通过证明 URL 未被篡改
+   └─ ProcessCallback: 使用 UploadSession.UID 注入用户上下文
+                         使用 UploadSession.Props.Size 校验文件大小
+```
+
+### 9.4 安全设计亮点
+
+1. **密钥分离原则**：
+   - CallbackSecret 是每个会话独有的，只用于 URL 路径
+   - HMAC 密钥（SlaveKey）是节点级别的长期密钥，不暴露在 URL 中
+   - UploadSession 中的状态数据完全服务端存储，客户端不可篡改
+
+2. **纵深防御**：
+   - 即使 CallbackSecret 泄露，HMAC 签名仍然保护请求完整性
+   - 即使 HMAC 密钥泄露，UploadSession 中的文件大小、过期时间等状态仍然限制攻击者的操作范围
+
+3. **最小权限原则**：
+   - CallbackSecret 返回给前端，但不授予任何权限（只是 URL 的一部分）
+   - HMAC 密钥只在 Master 和 Slave 节点间共享，前端无法获取
+   - UploadSession 永远不离开 Master 侧的 KV 存储
+
+4. **失效安全**：
+   - UploadSession 有 TTL，过期自动删除
+   - HMAC 签名有过期时间，防止重放攻击
+   - 上传完成后立即删除 UploadSession，防止二次使用
+
+---
+
+## 十、匿名用户机制深度解析 — 为什么空 Authorization 不尝试从 Session 恢复身份
 
 ### 8.1 AnonymousUser 的构造（[user.go#L432-L445](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/inventory/user.go#L432-L445)）
 
