@@ -229,27 +229,68 @@ func SharePreview(dep dependency.Dep) gin.HandlerFunc {
 
 ```go
 func renderShareOGPage(c *gin.Context, dep dependency.Dep, id, password string) string {
-    // ...
+    data := &ogData{
+        SiteName:    siteBasic.Name,
+        Title:       siteBasic.Name,          // 默认：站点名
+        Description: siteBasic.Description,    // 默认：站点描述
+        ShareURL:    routes.MasterShareUrl(base, id, password).String(), // URL 中包含从路径提取的密码
+        RedirectURL: routes.MasterShareLongUrl(id, password).String(),
+        ImageURL:    pwa.MediumIcon,           // 默认：PWA 图标
+    }
+
+    shareID, err := dep.HashIDEncoder().Decode(id, hashid.ShareID)
+    if err != nil {
+        data.Description = ogStatusInvalidLink  // "Invalid Link" — ID 无法解码
+        return renderOGHTML(data)
+    }
+
+    // 关键点：loadShareForOG → ShareInfoService.Get()
+    // 密码错误不会返回 error，只会 unlocked=false
+    // 只有分享过期、源文件失效、所有者被封、ID 不存在才会返回 error
     shareInfo, err := loadShareForOG(c, shareID, password)
     if err != nil {
-        // 密码错误或过期时，展示错误描述
+        // ❌ 错误分支：仅针对 ID 无效 + 分享失效
         var appErr serializer.AppError
         if errors.As(err, &appErr) {
-            data.Description = appErr.Msg
+            data.Description = appErr.Msg  // 通常是 "Share link expired"
         } else {
-            data.Description = ogStatusInvalidLink
+            data.Description = ogStatusInvalidLink  // "Invalid Link"
         }
         return renderOGHTML(data)
     }
 
-    // 解锁后才展示文件大小和缩略图
-    if shareInfo.Unlocked {
+    // ✅ 正常分支：包括密码错误的锁定态（unlocked=false）也会走这里！
+    data.Title = shareInfo.Name  // 标题始终是文件名（无论锁定与否）
+
+    if shareInfo.SourceType != nil && *shareInfo.SourceType == types.FileTypeFolder {
+        // 文件夹（无论是否锁定）：Description = "Folder"
+        data.Description = "Folder"
+    } else if shareInfo.Unlocked {
+        // 🔓 解锁态文件：Description = 文件大小 + 真实缩略图
         data.Description = formatFileSize(shareInfo.Size)
         thumbnail, err := loadShareThumbnail(c, id, password, shareInfo)
-        // ...
+        if err == nil {
+            data.ImageURL = thumbnail  // 替换为真实文件缩略图
+        }
     }
+    // 🔒 锁定态文件：Description 保持为默认的站点描述，不显示大小，缩略图仍是 PWA 图标
+
+    // 无论锁定与否，末尾都拼接所有者昵称
+    data.Description += " · " + shareInfo.Owner.Nickname
+    return renderOGHTML(data)
 }
 ```
+
+#### OG 预览四场景对比
+
+| 场景 | Title | Description | ImageURL |
+|------|-------|-------------|----------|
+| **锁定态文件**（密码错误/未传） | 文件名 | `站点默认描述 · 所有者昵称` | PWA 图标 |
+| **解锁态文件**（密码正确） | 文件名 | `12.34 MB · 所有者昵称` | 文件缩略图 |
+| **文件夹**（无论是否锁定） | 文件夹名 | `Folder · 所有者昵称` | PWA 图标 |
+| **分享失效/过期** | 站点名 | `"Share link expired"` 或 `"Invalid Link"` | PWA 图标 |
+
+**之前的理解偏差纠正**：密码错误时**不会**进入错误分支展示错误描述。错误分支只处理「ID 解码失败 + 分享过期/失效」。密码错误时 OG 页面仍能看到文件名和所有者昵称，只是文件大小隐藏、用站点图标代替缩略图。
 
 ### 5.3 视图同步（disableView）控制
 
