@@ -659,19 +659,110 @@ res.Files[i].Path[pathIndexUser] = newSharedWithMeUri(hashid.EncodeFileID(t.hash
 
 但 `Path[pathIndexRoot]` 永远保持 nil。
 
-**Owner 视角路径缓存为什么不再代表通用规则**：
+**Owner 视角路径缓存为什么不再代表通用规则，且 `Uri(true)` 也不能兜底**：
 
-`Path[pathIndexRoot]`（owner 视角路径）在标准导航场景下通过 `newFile` 自动从父级继承，但在以下场景中失效：
+`Path[pathIndexRoot]`（owner 视角路径）在标准导航场景下通过 `newFile` 自动从父级继承，在各场景的状态如下：
 
 | 场景 | Path[pathIndexRoot] 状态 | 原因 |
 |------|------------------------|------|
 | 标准 my 目录浏览 | 正常：`cloudreve://my/folder1/file.txt` | `parent != nil` 且 `parent.Path[pathIndexRoot] != nil`，自动继承 |
-| sharedWithMe 列表 | **nil** | `parent = nil`，`newFile` 不设置；且虚拟根的 pathIndexRoot 也被覆盖为 sharedWithMe 前缀，不是真实 owner 根 |
-| 回收站列表 | **nil** | `parent = nil`，`newFile` 不设置；回收站文件无真实目录层级 |
-| 递归搜索展开的文件夹 | 正常：由 `f.Path[pathIndexUser] = p.Uri(false).Join(model.Name)` 手动设置 | 递归搜索中单独处理，与 `newFile` 自动继承逻辑不同 |
-| 回收站恢复时的目标定位 | 正常：通过 `MetadataRestoreUri` 恢复 | 从元数据中取回原始 owner 视角 URI |
+| sharedWithMe 列表 | **nil** | `parent = nil`，`newFile` 不设置；且虚拟根的 pathIndexRoot 被覆盖为 sharedWithMe 前缀，不是真实 owner 根 |
+| 回收站列表 | **nil** | `parent = nil`，`newFile` 不设置；回收站 Children 只设置了 `Path[pathIndexUser]` |
+| 递归搜索展开的文件夹 | 用户视角正常，owner 视角 nil | 递归搜索仅手动设置了 `Path[pathIndexUser]`，未设置 `Path[pathIndexRoot]` |
+| 回收站 To() 单文件定位 | 被覆盖为 trash URI | `current.Path[pathIndexRoot] = current.Path[pathIndexUser]`（[trash_navigator.go#L95](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/trash_navigator.go#L95)），两者相同，都是 trash 虚拟路径 |
 
-**核心结论**：`Path[pathIndexRoot]` 仅在"标准 my 文件系统的正常层级导航"场景下可靠。在 sharedWithMe、回收站、递归搜索等场景中，它可能为 nil 或被覆盖为虚拟前缀，**不能作为通用规则来推导文件的真实 owner 路径**。如需 owner 视角路径，应优先使用 `f.Uri(true)`，该方法会向上遍历直到找到有 `Path[index]` 的祖先。
+**关键：`Uri(true)` 也不能作为 owner 视角路径的通用兜底**
+
+`Uri(isRoot bool)` 方法的完整逻辑（[file.go#L177-L199](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/file.go#L177-L199)）：
+
+```go
+func (f *File) Uri(isRoot bool) *fs.URI {
+    index := 1
+    if isRoot {
+        index = 0  // pathIndexRoot
+    }
+    // 短路条件：有缓存 或 无父级 → 直接返回缓存
+    if f.Path[index] != nil || f.Parent == nil {
+        return f.Path[index]  // ← 可能为 nil！
+    }
+
+    // 只有当有父级且 Path[index] 为 nil 时，才向上遍历拼接
+    elements := make([]string, 0)
+    parent := f
+    for parent.Parent != nil && parent.Path[index] == nil {
+        elements = append([]string{parent.Name()}, elements...)
+        parent = parent.Parent
+    }
+
+    if parent.Path[index] == nil {
+        return nil  // ← 最终仍可能为 nil
+    }
+    return parent.Path[index].Join(elements...)
+}
+```
+
+**sharedWithMe 游离节点的失效链路**：
+
+对于 sharedWithMe 列表结果（游离节点）：
+1. `f.Parent == nil`（游离节点没有挂到任何父节点）
+2. 命中短路条件 `f.Path[index] != nil || f.Parent == nil` 中的 `f.Parent == nil`
+3. **直接返回 `f.Path[pathIndexRoot]`** — 而这个值是 nil！
+4. `Uri(true)` **不会**尝试任何补救措施（如读取元数据），直接返回 nil
+
+这是因为 `Uri()` 方法的设计前提是"**如果没有父级，那文件自身就是根，Path 缓存一定已经被设置过了**"。但 sharedWithMe 游离节点打破了这个前提：它们 `Parent == nil` 但**不是根**，且 Path 缓存也未被设置，所以 `Uri(true)` 对它们毫无办法。
+
+对比 `Uri(false)`（用户视角）为什么可以正常工作：
+- sharedWithMe navigator 在 Children 中**手动覆盖**了 `Path[pathIndexUser]`：
+  `res.Files[i].Path[pathIndexUser] = newSharedWithMeUri(hashid.EncodeFileID(...))`
+- 同样因为 `f.Parent == nil`，`Uri(false)` 走短路直接返回 `Path[pathIndexUser]`
+- 但用户视角路径被手动设置了，所以返回有效值
+
+**三种路径失效场景的完整闭合关系**：
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                    sharedWithMe 虚拟路径                               │
+│  问题：文件是 symbolic 链接，owner 视角路径指向原所有者的文件系统        │
+│  解决：Path[pathIndexUser] = newSharedWithMeUri(hashid)                │
+│        用 hashid 编码文件 ID 作为虚拟路径，跳过目录树解析                │
+│  后果：Path[pathIndexRoot] 为 nil，Uri(true) 因 Parent==nil 短路返回 nil│
+│        真实 owner 路径存储在 sys:shared_redirect 元数据中               │
+│        Uri() 不读元数据，所以无法恢复                                    │
+└────────────────────────────────────┬──────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                  Uri(true) 的失效边界                                   │
+│  短路条件：f.Path[index] != nil || f.Parent == nil                     │
+│  游离节点：Parent == nil 且 Path[pathIndexRoot] == nil                  │
+│  结果：Uri(true) 直接返回 nil，不尝试向上遍历或读取元数据               │
+│  原因：Uri() 假设"无父级=是根节点=Path已手动设置"，游离节点打破此前提    │
+└────────────────────────────────────┬──────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                  restore_uri 的可见性设计                               │
+│  问题：回收站文件被 SoftDelete，name 变为 UUID，file_children 被清除     │
+│  解决：sys:restore_uri 元数据记录原始 owner 视角路径                    │
+│        DisplayName() 读取 restore_uri 显示原始文件名                    │
+│        恢复时用 restore_uri 定位目标目录                                │
+│  关键：is_public=true 所以通过公开元数据链路即可读取                     │
+│        但 OwnerIDEQ + ClearParent 两层边界保证仅 owner 可见             │
+│        Uri(true) 对回收站文件也返回 nil（同 sharedWithMe 原因）         │
+│        所以必须用元数据而非 Uri() 来恢复原始路径                         │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+**三条设计规律相互闭合**：
+
+1. **当目录树结构失效时（`Parent == nil`），`Uri()` 的基于树遍历的路径推导必然失效** — sharedWithMe 游离节点和回收站孤儿文件都属于这种情况
+2. **树结构失效时，必须依赖元数据存储路径信息** — sharedWithMe 用 `sys:shared_redirect`，回收站用 `sys:restore_uri`
+3. **但元数据的用途和可见性不同**：`shared_redirect` 用于访问时跳转（由 DBFS.SharedAddressTranslation 在遇到 symbolic folder 时读取，需要 QueryMetadata 兜底延迟加载），而 `restore_uri` 用于显示名称和恢复目标（仅 owner 自己可见，设为 `is_public=true` 可走通用公开元数据链路）
+
+**核心结论**：
+- `Path[pathIndexRoot]` 仅在"标准 my 文件系统的正常层级导航"场景下可靠
+- `Uri(true)` 仅在 `Path[pathIndexRoot]` 有缓存 **或** `Parent != nil` 且向上能找到有缓存的祖先时可靠
+- **对 sharedWithMe 和回收站的游离节点，两者都不可靠**，必须通过其他机制获取真实路径（虚拟路径编码 ID、元数据存储原始 URI）
 
 **URI 与导航器的映射**（[dbfs.go#L738-L739](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L738-L739)）：
 
