@@ -32,7 +32,7 @@ Cloudreve 的 WOPI 实现在分层架构中跨越多个模块：
 ┌───────────────────▼─────────────────────────────┐
 │            中间件层 (middleware/wopi.go)        │
 │  - ViewerSessionValidation (访问令牌验证)       │
-│  - WopiWriteAccess        (写入权限验证)        │
+│  - WopiWriteAccess        (未使用!)             │
 └───────────────────┬─────────────────────────────┘
                     │
 ┌───────────────────▼─────────────────────────────┐
@@ -115,12 +115,28 @@ func (m *manager) CreateViewerSession(ctx context.Context, uri *fs.URI, version 
 
 ### 2.3 写入权限控制
 
-**核心代码**：[middleware/wopi.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/middleware/wopi.go#L16-L28)
+> **⚠️ 重要修正**：`WopiWriteAccess` 中间件**定义了但未在路由中使用**！
 
-`WopiWriteAccess` 中间件在执行写入操作前验证权限：
+**核心代码**：
+- 定义：[middleware/wopi.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/middleware/wopi.go#L16-L28)
+- 路由：[router.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/routers/router.go#L215-L225)
 
-- 检查会话的 `Action` 字段是否为 `ActionEdit`
-- 只读会话（`ActionPreview` / `ActionView`）返回 404 和 "read-only access" 错误
+**实际路由配置**：
+```go
+wopi := noAuth.Group("file/wopi",
+    middleware.HashID(hashid.FileID),
+    middleware.ViewerSessionValidation())  // 只有会话验证，没有 WopiWriteAccess!
+```
+
+**关键问题**：
+1. `WopiWriteAccess` 中间件试图读取 `wopi.WopiSessionCtx`，但该上下文**从未被设置**
+2. 路由中没有使用 `WopiWriteAccess` 中间件
+3. 因此，**服务端没有在中间件层面强制拦截写入请求**
+
+**实际的写入权限限制**：
+- 权限判定只在 `FileInfo` 接口中通过 `canEdit` 字段**告知客户端**
+- 客户端根据 `ReadOnly` 字段决定是否显示编辑界面
+- 但只要持有有效的 `access_token`，理论上可以直接调用 `PUT /contents` 接口写入
 
 ### 2.4 编辑权限判定
 
@@ -137,6 +153,8 @@ canEdit := file.PrimaryEntityID() == targetEntity.ID()  // 必须是最新版本
 - `ReadOnly: false`
 - `UserCanWrite: true`
 - `UserCanReview: true`
+
+**注意**：这只是告知客户端的权限标识，不是服务端的强制拦截。
 
 ---
 
@@ -311,14 +329,18 @@ PutContent 处理流程：
 └───────────────────┬─────────────────────────────┘
                     │
 ┌───────────────────▼─────────────────────────────┐
-│ 2. 锁验证（如有锁令牌）                          │
+│ 2. 锁验证（仅当携带锁令牌时）                     │
 │    ├─ 从 X-WOPI-Lock 头部获取锁令牌             │
-│    ├─ ConfirmLock 验证令牌有效性                │
-│    │  ├─ 验证失败：尝试用该令牌创建新锁          │
-│    │  │  ├─ 创建成功：解锁并返回空锁令牌        │
-│    │  │  └─ 创建失败（冲突）：返回 409          │
-│    │  └─ 验证成功：defer 释放锁                 │
-│    └─ 保存 LockSession 供后续使用               │
+│    ├─ if lockToken != "" {                      │
+│    │  ├─ ConfirmLock 验证令牌有效性             │
+│    │  │  ├─ 验证失败：尝试用该令牌创建新锁        │
+│    │  │  │  ├─ 创建成功：解锁并返回空锁令牌      │
+│    │  │  │  └─ 创建失败（冲突）：返回 409        │
+│    │  │  └─ 验证成功：defer 释放锁               │
+│    │  └─ 保存 LockSession 供后续使用             │
+│    └─ } else {                                   │
+│       └─ lockSession = nil（不进行任何锁检查）  │
+│    }                                             │
 └───────────────────┬─────────────────────────────┘
                     │
 ┌───────────────────▼─────────────────────────────┐
@@ -332,7 +354,7 @@ PutContent 处理流程：
 ┌───────────────────▼─────────────────────────────┐
 │ 4. 执行文件更新                                  │
 │    ├─ 创建 FileUpdateService                    │
-│    ├─ 注入 LockSession 到上下文                 │
+│    ├─ 注入 LockSession（可能为 nil）到上下文     │
 │    └─ 调用 PutContent 执行实际更新              │
 └───────────────────┬─────────────────────────────┘
                     │
@@ -344,6 +366,14 @@ PutContent 处理流程：
 │    └─ PUT_RELATIVE：返回新文件名 JSON           │
 └─────────────────────────────────────────────────┘
 ```
+
+> **⚠️ 重要修正**：锁验证是**可选**的！
+>
+> 代码逻辑：`if lockToken != "" { ... }`
+> - 如果客户端不携带 `X-WOPI-Lock` 头部，**整个锁验证逻辑完全跳过**
+> - `lockSession` 为 `nil`，直接执行文件更新
+> - 不会创建锁，也不会进行任何冲突检查
+> - 锁机制是客户端的"建议"，不是服务端的强制要求
 
 ### 4.3 UTF-7 文件名解码
 
@@ -367,7 +397,7 @@ func (service *FileUpdateService) PutContent(c *gin.Context, ls fs.LockSession) 
 1. **内容长度嗅探**：通过 `request.SniffContentLength` 获取请求体大小
 2. **大小限制检查**：不超过 `MaxOnlineEditSize` 配置
 3. **构建上传请求**：`fs.UploadRequest` 包含文件内容和元数据
-4. **注入锁会话**：将 `LockSession` 注入上下文供文件管理器使用
+4. **注入锁会话**：将 `LockSession`（可能为 `nil`）注入上下文
 5. **执行更新**：调用 `m.Update(ctx, fileData)` 更新文件
 6. **返回结果**：包含新版本号的文件信息
 
@@ -382,7 +412,7 @@ wopi := noAuth.Group("file/wopi",
 {
     wopi.GET(":id", controllers.CheckFileInfo)        // 获取文件元数据
     wopi.GET(":id/contents", controllers.GetFile)      // 获取文件内容
-    wopi.POST(":id/contents", controllers.PutFile)     // 更新文件内容
+    wopi.POST(":id/contents", controllers.PutFile)     // 更新文件内容（无写入权限中间件!）
     wopi.POST(":id", controllers.ModifyFile)           // 通用修改（锁、另存为）
 }
 ```
@@ -393,30 +423,40 @@ wopi := noAuth.Group("file/wopi",
 
 ### 5.1 冲突预防机制
 
-#### 5.1.1 乐观锁通过文件锁实现
+#### 5.1.1 悲观锁策略（客户端可选）
 
-WOPI 采用 **悲观锁** 策略防止冲突：
-1. 客户端在编辑前先获取文件锁（LOCK 操作）
+WOPI 采用 **悲观锁** 策略防止冲突，但锁是**客户端可选**的：
+
+```
+客户端正确流程（带锁）：
+1. 编辑前先获取文件锁（LOCK 操作）
 2. 持有锁期间定期刷新（REFRESH_LOCK，每 10 分钟左右）
-3. 回写时必须携带有效的锁令牌
+3. 回写时携带有效的锁令牌
 4. 编辑完成后释放锁（UNLOCK）
 
-#### 5.1.2 锁前置检查
+实际可能的流程（不带锁）：
+1. 直接获取文件内容（GetFile）
+2. 编辑后直接回写（PutFile），不携带锁令牌
+3. 服务端不进行任何冲突检查，直接覆盖
+```
+
+#### 5.1.2 锁前置检查（仅当携带锁令牌时）
 
 **核心代码**：[viewer.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/viewer.go#L170-L210)
 
-在 `PutContent` 中，即使客户端未携带锁令牌，系统也会尝试创建锁：
 ```go
 lockToken := c.GetHeader(wopi.LockTokenHeader)
 if lockToken != "" {
-    // 验证现有锁
+    // 只有当 lockToken 不为空时才验证锁
     release, ls, err := m.ConfirmLock(c, file, file.Uri(false), lockToken)
     if err != nil {
         // 验证失败，尝试创建新锁
         ls, err := m.Lock(c, wopi.LockDuration, user, true, app, file.Uri(false), lockToken)
         // ...
     }
+    // ...
 }
+// 如果 lockToken 为空，跳过所有锁检查，直接更新
 ```
 
 ### 5.2 冲突检测与响应
@@ -441,11 +481,13 @@ if errors.As(err, &lockConflict) {
 - 响应头：`X-WOPI-Lock` 包含当前文件上的锁令牌
 - 客户端收到 409 后应提示用户"文件正在被其他人编辑"
 
-#### 5.2.2 一致性检查
+**注意**：只有当客户端携带锁令牌时才可能触发此响应。
+
+#### 5.2.2 一致性检查（仅在获取锁后执行）
 
 **核心代码**：[dbfs/lock.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/filemanager/fs/dbfs/lock.go#L220-L263)
 
-在 `acquireByPath` 获取锁后，执行 `ensureConsistency` 检查：
+在 `acquireByPath` 获取锁**之后**，执行 `ensureConsistency` 检查：
 
 ```go
 func (f *DBFS) ensureConsistency(ctx context.Context, files ...*File) error {
@@ -458,9 +500,16 @@ func (f *DBFS) ensureConsistency(ctx context.Context, files ...*File) error {
 }
 ```
 
-这防止了 **TOCTOU**（Time Of Check, Time Of Use）攻击：在文件查询和锁获取之间，文件可能已被修改。
+这防止了 **TOCTOU**（Time Of Check, Time Of Use）问题：在文件查询和锁获取之间，文件可能已被修改。
 
-### 5.3 版本追踪
+**关键限制**：
+- 只在 `acquireByPath` 中调用，即只有获取锁时才执行
+- 如果不携带锁令牌，跳过锁获取，`ensureConsistency` 也不会执行
+- 只检查元数据，不检查内容版本
+
+### 5.3 版本与冲突校验的生效层级
+
+> **⚠️ 重要修正**：版本号**不用于**冲突校验！
 
 **核心代码**：[response.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/response.go#L196-L238)
 
@@ -474,10 +523,20 @@ type WopiFileInfo struct {
 }
 ```
 
-**版本标识**：
+**版本标识的实际作用**：
 - `Version` 字段是实体 ID 的 HashID 编码
 - 每次成功更新后，`X-WOPI-ItemVersion` 响应头返回新版本
-- 客户端可通过版本变化检测到其他编辑
+- 客户端可通过版本变化检测到其他编辑（但服务端不验证）
+- **回写时不进行任何版本校验**，不会因为版本过期而拒绝更新
+
+**冲突校验的实际生效层级**：
+
+| 层级 | 校验机制 | 生效条件 | 说明 |
+|-----|---------|---------|------|
+| 1. WOPI 服务层 | 锁令牌验证 | 客户端携带 `X-WOPI-Lock` 头部 | 可选，客户端可跳过 |
+| 2. DBFS 锁层 | `ensureConsistency` 检查 | 获取锁成功后自动执行 | 依赖上层锁机制 |
+| 3. 数据库层 | 数据库事务 | 总是执行 | 保证原子性，但不检查业务冲突 |
+| - | 版本号校验 | ❌ 未实现 | 版本号只用于标识，不用于校验 |
 
 ### 5.4 锁持有者信息
 
@@ -499,13 +558,14 @@ type Application struct {
 
 ### 5.5 冲突场景总结
 
-| 场景 | 检测点 | 响应 |
-|-----|--------|------|
-| 文件已被他人锁定 | LOCK/REFRESH_LOCK/PutContent 时 ConfirmLock 失败 | 409 + X-WOPI-Lock |
-| 锁令牌不匹配 | LOCK/PutContent 时令牌与现有锁不一致 | 409 + X-WOPI-Lock |
-| 文件在锁定间隙被修改 | acquireByPath 后的 ensureConsistency 检查 | fs.ErrModified |
-| 文件大小超限 | PutContent 中检查 MaxOnlineEditSize | 413 Request Too Large |
-| 文件已被删除 | PutContent 中 Get 返回 CodeNotFound | 404 Not Found |
+| 场景 | 检测点 | 响应 | 生效条件 |
+|-----|--------|------|---------|
+| 文件已被他人锁定 | LOCK/REFRESH_LOCK 时 ConfirmLock 失败 | 409 + X-WOPI-Lock | 客户端携带锁令牌 |
+| 锁令牌不匹配 | PutContent 时令牌与现有锁不一致 | 409 + X-WOPI-Lock | 客户端携带锁令牌 |
+| 文件在锁定间隙被修改 | acquireByPath 后的 ensureConsistency 检查 | fs.ErrModified | 客户端携带锁令牌 |
+| 并发无锁写入 | ❌ 无检测 | 后写入者覆盖先写入者 | 客户端不携带锁令牌 |
+| 文件大小超限 | PutContent 中检查 MaxOnlineEditSize | 413 Request Too Large | 总是生效 |
+| 文件已被删除 | PutContent 中 Get 返回 CodeNotFound | 404 Not Found | 总是生效 |
 
 ---
 
@@ -516,9 +576,9 @@ type Application struct {
 | [pkg/wopi/wopi.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/wopi/wopi.go) | WOPI 协议常量与工具 | `GenerateWopiSrc`, `LockDuration` |
 | [pkg/wopi/types.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/wopi/types.go) | 类型定义 | `SessionCache`, `WopiDiscovery` |
 | [pkg/wopi/utf7.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/pkg/wopi/utf7.go) | UTF-7 编解码 | `UTF7Decode`, `UTF7Encode` |
-| [middleware/wopi.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/middleware/wopi.go) | 鉴权中间件 | `ViewerSessionValidation`, `WopiWriteAccess` |
+| [middleware/wopi.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/middleware/wopi.go) | 鉴权中间件 | `ViewerSessionValidation`, `WopiWriteAccess`（未使用） |
 | [routers/controllers/wopi.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/routers/controllers/wopi.go) | WOPI 控制器 | `CheckFileInfo`, `GetFile`, `PutFile`, `ModifyFile` |
-| [routers/router.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/routers/router.go#L215-L225) | 路由定义 | WOPI 端点路由组 |
+| [routers/router.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/routers/router.go#L215-L225) | 路由定义 | WOPI 端点路由组（无 WopiWriteAccess） |
 | [service/explorer/viewer.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/viewer.go) | WOPI 业务逻辑 | `WopiService.Lock`, `PutContent`, `FileInfo` |
 | [service/explorer/file.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/file.go#L305-L354) | 文件更新 | `FileUpdateService.PutContent` |
 | [service/explorer/response.go](file:///d:/fz/0601-1/solo-dogfeeding/code/50-Cloudreve/service/explorer/response.go#L196-L238) | 响应类型 | `WopiFileInfo` |
@@ -543,7 +603,8 @@ type Application struct {
     |                  | 4. CheckFileInfo (access_token) |
     |                  |------------------>|
     |                  |                   | 验证会话
-    |                  | 5. 返回文件元数据 |
+    |                  |                   | 设置 ReadOnly/UserCanWrite
+    |                  | 5. 返回文件元数据  |
     |                  |<------------------|
     |                  |                   |
     |                  | 6. GetFile        |
@@ -565,8 +626,9 @@ type Application struct {
     |                  |                   |
     |                  | 12. PUT /contents (X-WOPI-Lock: token) |
     |                  |------------------>|
-    |                  |                   | 验证锁
+    |                  |                   | 验证锁（如携带）
     |                  |                   | 更新文件
+    |                  |                   | ⚠️ 不验证版本号
     |                  | 13. 200 OK + X-WOPI-ItemVersion |
     |                  |<------------------|
     |                  |                   |
@@ -577,5 +639,25 @@ type Application struct {
 
 ---
 
+## 8. 关键修正总结
+
+### 修正 1：写入权限的限制者
+- **错误理解**：`WopiWriteAccess` 中间件在路由层强制拦截写入
+- **实际实现**：`WopiWriteAccess` 中间件**未被使用**，路由中只有 `ViewerSessionValidation`
+- **实际限制**：通过 `FileInfo` 中的 `ReadOnly` 字段告知客户端，无服务端强制拦截
+
+### 修正 2：未带锁令牌时的回写流程
+- **错误理解**：即使未带锁令牌，系统也会自动创建锁
+- **实际实现**：`if lockToken != "" { ... }`，未携带则**完全跳过锁检查**
+- **安全隐患**：客户端可绕过锁机制直接写入，可能导致数据覆盖
+
+### 修正 3：版本与冲突校验的生效层级
+- **错误理解**：版本号用于冲突校验，每次更新检查版本
+- **实际实现**：版本号仅用于标识，**回写时不校验版本**
+- **实际校验层级**：锁机制（可选）→ `ensureConsistency`（锁后）→ 数据库事务（总是）
+
+---
+
 *文档生成时间：2026-06-13*
 *基于 Cloudreve v4 代码库分析*
+*最后修正：2026-06-13（修正写入权限、锁流程、版本校验三处理解错误）*
