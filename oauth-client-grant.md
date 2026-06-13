@@ -4,8 +4,11 @@
 
 1. [OAuth Client 配置](#1-oauth-client-配置)
 2. [Grant 生命周期](#2-grant-生命周期)
+   - [2.2.5 Grant 在授权确认到换 Token 之间的状态变化](#225-grant-在授权确认到换-token-之间的状态变化补充)
 3. [Scope 边界](#3-scope-边界)
+   - [3.5 Scope 收缩后的实际生效边界](#35-scope-收缩后的实际生效边界补充)
 4. [撤销风险分析](#4-撤销风险分析)
+   - [4.2.6 撤销后的访问窗口：精确时间线](#426-撤销后的访问窗口精确时间线补充)
 
 ---
 
@@ -200,6 +203,22 @@ type AuthorizationCode struct {
 - 即使授权码过期/被丢弃，grant 仍然存在且有效
 - Token 交换和后续 refresh 只更新 `last_used_at`，不改变 scope
 - Grant 一旦创建，只能通过显式删除（用户撤销 / 管理员删客户端）或 UPSERT 覆盖（再次 consent）来改变
+
+#### 2.2.6 哪些操作会刷新 `grant.last_used_at`（代码对照）
+
+通过全局搜索 `UpdateGrantLastUsedAt` 和 `UpsertGrant` 的所有调用点，整个代码库中只有 **3 处**会更新 `last_used_at`：
+
+| # | 操作 | 代码位置 | 更新方式 | 是否同时更新 scopes |
+|---|------|---------|---------|-------------------|
+| 1 | 用户调用 `/oauth/consent` 同意授权 | [oauth.go L100](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/service/oauth/oauth.go#L100) → [oauth_client.go L100-L112](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/inventory/oauth_client.go#L100-L112) `UpsertGrant` | `ON CONFLICT ... UpdateLastUsedAt()` | ✅ 是（同时 `UpdateScopes()`） |
+| 2 | 调用 `/oauth/token` 用授权码换 token | [oauth.go L211](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/service/oauth/oauth.go#L211) → [oauth_client.go L114-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/inventory/oauth_client.go#L114-L119) `UpdateGrantLastUsedAt` | `UPDATE ... SET last_used_at = NOW()` | ❌ 否 |
+| 3 | 用 Refresh Token 刷新新 token | [jwt.go L179](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/pkg/auth/jwt.go#L179) → [oauth_client.go L114-L119](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/inventory/oauth_client.go#L114-L119) `UpdateGrantLastUsedAt` | `UPDATE ... SET last_used_at = NOW()` | ❌ 否 |
+
+**重要细节差异**：
+- **操作 1 (UpsertGrant)** 同时更新 `scopes` 和 `last_used_at`。这是唯一能改变 grant.scopes 的代码路径（除此之外只有删除再重建）。
+- **操作 2 (换 token)** 更新失败时**不报错**（只打 Warning 日志，见 [oauth.go L211-L213](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/service/oauth/oauth.go#L211-L213)），即使 `last_used_at` 更新失败，token 照常签发。
+- **操作 3 (Refresh)** 更新失败时**报错终止**（`return nil, ErrInvalidRefreshToken`，见 [jwt.go L179-L181](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/pkg/auth/jwt.go#L179-L181)）。
+- 日常使用 Access Token 调用 API **不会**更新 `last_used_at`——`VerifyAndRetrieveUser` 中没有任何数据库写操作。
 
 ---
 
