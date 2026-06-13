@@ -10,25 +10,25 @@
 
 定义在 [migrator.go#L44-L63](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L44-L63)，严格按序执行：
 
-| Step 常量 | 值 | 说明 |
-|---|---|---|
-| `StepInitial` | 0 | 初始状态 |
-| `StepSchema` | 1 | 创建 V4 表结构 |
-| `StepSettings` | 2 | 迁移系统设置 |
-| `StepNode` | 3 | 迁移节点 |
-| `StepPolicy` | 4 | 迁移存储策略 |
-| `StepGroup` | 5 | 迁移用户组 |
-| `StepUser` | 6 | 迁移用户 |
-| `StepFolders` | 7 | 迁移文件夹 |
-| `StepFolderParent` | 8 | 补设文件夹父级关系 |
-| `StepFile` | 9 | 迁移文件 |
-| `StepShare` | 10 | 迁移分享 |
-| `StepDirectLink` | 11 | 迁移直链 |
-| `Step_CommunityPlaceholder1` | 12 | 占位 |
-| `Step_CommunityPlaceholder2` | 13 | 占位 |
-| `StepAvatar` | 14 | 迁移头像文件 |
-| `StepWebdav` | 15 | 迁移 WebDAV 账户 |
-| `StepCompleted` | 16 | 完成 |
+| Step 常量 | 值 | 说明 | 类型 | 事务粒度 |
+|---|---|---|---|---|
+| `StepInitial` | 0 | 初始状态 | — | — |
+| `StepSchema` | 1 | 创建 V4 表结构 | 一次性 | Ent 内置幂等 |
+| `StepSettings` | 2 | 迁移系统设置 | 一次性 | 单事务 |
+| `StepNode` | 3 | 迁移节点 | 一次性 | 无事务 |
+| `StepPolicy` | 4 | 迁移存储策略 | 一次性 | 单事务 |
+| `StepGroup` | 5 | 迁移用户组 | 一次性 | 无事务 |
+| `StepUser` | 6 | 迁移用户 | 批量 | 每批一事务 |
+| `StepFolders` | 7 | 迁移文件夹 | 批量 | 每批一事务 |
+| `StepFolderParent` | 8 | 补设文件夹父级关系 | 批量 | 每批一事务 |
+| `StepFile` | 9 | 迁移文件 | 批量 | 每批一事务 |
+| `StepShare` | 10 | 迁移分享 | 批量 | 每批一事务 |
+| `StepDirectLink` | 11 | 迁移直链 | 批量 | 每批一事务 |
+| `Step_CommunityPlaceholder1` | 12 | Pro 占位：礼品码 | 占位（Pro） | — |
+| `Step_CommunityPlaceholder2` | 13 | Pro 占位：容量包 | 占位（Pro） | — |
+| `StepAvatar` | 14 | 迁移头像文件 | 一次性 | 文件操作，无事务 |
+| `StepWebdav` | 15 | 迁移 WebDAV 账户 | 批量 | 每批一事务 |
+| `StepCompleted` | 16 | 完成 | — | — |
 
 ---
 
@@ -37,6 +37,7 @@
 ### 2.1 User 用户
 
 **V3 模型**：[model/user.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/user.go)
+**迁移函数**：[user.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/user.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -51,11 +52,12 @@
 | `Avatar` | `Avatar` | 非空时设置 |
 | — | `Settings` | 新增，固定值 `{VersionRetention: true, VersionRetentionMax: 10}` |
 
-**未迁移字段**：`Options`/`OptionsSerialized`（用户个性化配置如 `profile_off`, `preferred_theme`）、`Authn`（WebAuthn 凭据）、`PicInfo`。
+**未迁移字段**：`Options`/`OptionsSerialized`（用户个性化配置如 `profile_off`, `preferred_theme`）、`Authn`（WebAuthn 凭据）。
 
 ### 2.2 Folder 文件夹
 
 **V3 模型**：[model/folder.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/folder.go)
+**迁移函数**：[folders.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/folders.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -71,6 +73,7 @@
 ### 2.3 File 文件
 
 **V3 模型**：[model/file.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/file.go)
+**迁移函数**：[file.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/file.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -90,26 +93,27 @@
 ### 2.4 Policy 存储策略
 
 **V3 模型**：[model/policy.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/policy.go)
+**迁移函数**：[policy.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/policy.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
 | `gorm.Model.ID` | `RawID` | 原样保留 |
 | `Name` | `Name` | 直传 |
-| `Type` | `Type` | 直传（字符串策略类型如 "local", "onedrive" 等） |
+| `Type` | `Type` | 直传（字符串策略类型） |
 | `Server` | `Server` | 直传 |
 | `BucketName` | `BucketName` | 直传 |
 | `IsPrivate` | `IsPrivate` | 直传 |
 | `BaseURL` | → `Settings.CustomProxy` + `Settings.ProxyServer` | 非空时设置自定义代理 |
 | `AccessKey` | `AccessKey` | 直传 |
 | `SecretKey` | `SecretKey` | 直传 |
-| `MaxSize` | `MaxSize` | 类型转换 uint64→int64 |
+| `MaxSize` | `MaxSize` | uint64→int64 |
 | `DirNameRule` | `DirNameRule` | 直传（缺随机元素时强制覆盖默认值） |
 | `FileNameRule` | `FileNameRule` | 直传（缺随机元素时强制覆盖默认值） |
-| `Options` (JSON) | → `Settings` (PolicySetting) | 逐字段映射见下表 |
+| `Options` (JSON) | → `Settings` (PolicySetting) | 逐字段映射 |
 
 **PolicyOption → PolicySetting 映射**：
 
-| V3 PolicyOption 字段 | V4 PolicySetting 字段 |
+| V3 PolicyOption | V4 PolicySetting |
 |---|---|
 | `Token` | `Token` |
 | `FileType` | `FileType` |
@@ -128,7 +132,7 @@
 - OneDrive 策略自动设置 `ThumbSupportAllExts=true`
 - COS/OSS/又拍云/七牛/远程策略根据类型硬编码 `ThumbExts`
 - COS 策略强制 `ChunkSize=25MB`
-- 缩略图代理设置从 V3 的 `thumb_proxy_enabled` + `thumb_proxy_policy` 系统设置读取
+- 缩略图代理设置从 V3 系统设置 `thumb_proxy_enabled` + `thumb_proxy_policy` 读取
 - 远程策略（`PolicyTypeRemote`）自动创建一个 Slave Node
 
 **未迁移字段**：`AutoRename`、`IsOriginLinkEnable`、`OptionsSerialized.MimeType`、`OptionsSerialized.PlaceholderWithSize`。
@@ -136,6 +140,7 @@
 ### 2.5 Group 用户组
 
 **V3 模型**：[model/group.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/group.go)
+**迁移函数**：[group.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/group.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -143,25 +148,12 @@
 | `Name` | `Name` | 直传 |
 | `Policies` (JSON) | `StoragePoliciesID` | 取过滤后的策略列表第一个 |
 | `MaxStorage` | `MaxStorage` | uint64→int64 |
-| `ShareEnabled` | → `Permissions[GroupPermissionShare]` | 布尔值转为权限位 |
-| `WebDAVEnabled` | → `Permissions[GroupPermissionWebDAV]` | 布尔值转为权限位 |
+| `ShareEnabled` | → `Permissions[GroupPermissionShare]` | 布尔→权限位 |
+| `WebDAVEnabled` | → `Permissions[GroupPermissionWebDAV]` | 布尔→权限位 |
 | `SpeedLimit` | `SpeedLimit` | 直传 |
-| `Options` (JSON) | → `Settings` (GroupSetting) | 见下表 |
+| `Options` (JSON) | → `Settings` (GroupSetting) | 逐字段映射 |
 
-**GroupOption → GroupSetting 映射**：
-
-| V3 GroupOption 字段 | V4 GroupSetting 字段 |
-|---|---|
-| `CompressSize` | `CompressSize` |
-| `DecompressSize` | `DecompressSize` |
-| `Aria2Options` | `RemoteDownloadOptions` |
-| `SourceBatchSize` | `SourceBatchSize` |
-| `RedirectedSource` | `RedirectedSource` |
-| `Aria2BatchSize` | `Aria2BatchSize` |
-| — | `MaxWalkedFiles=100000` | 硬编码默认值 |
-| — | `TrashRetention=7*24*3600` | 硬编码 7 天 |
-
-**权限映射**：
+**权限映射表**：
 
 | V3 来源 | V4 权限 |
 |---|---|
@@ -182,6 +174,7 @@
 ### 2.6 Node 节点
 
 **V3 模型**：[model/node.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/node.go)
+**迁移函数**：[node.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/node.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -195,15 +188,6 @@
 | `Aria2Options` (JSON) | → `Settings.Aria2Setting` | 逐字段映射 |
 | `Rank` | `Weight` | 字段名变更 |
 
-**Aria2Option → Aria2Setting 映射**：
-
-| V3 Aria2Option | V4 Aria2Setting |
-|---|---|
-| `Server` | `Server` |
-| `Token` | `Token` |
-| `Options` (JSON string) | `Options` (map[string]any) |
-| `TempPath` | `TempPath` |
-
 Master 节点额外赋予 `NodeCapabilityExtractArchive` + `NodeCapabilityCreateArchive` 能力。
 
 **未迁移字段**：`MasterKey`、`Aria2Option.Interval`、`Aria2Option.Timeout`。
@@ -211,43 +195,21 @@ Master 节点额外赋予 `NodeCapabilityExtractArchive` + `NodeCapabilityCreate
 ### 2.7 Setting 系统设置
 
 **V3 模型**：[model/setting.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/setting.go)
+**迁移函数**：[settings.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/settings.go)
 
-迁移逻辑在 [settings.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/settings.go) 的 `migrators` 映射表中定义，分为三种处理：
+迁移逻辑通过 `migrators` map 表驱动，分为四类处理：
 
-1. **noopMigrator（丢弃）**：以下 V3 设置在 V4 中不再需要，直接跳过：
-   - `siteKeywords`, `over_used_template`, `download_timeout`, `preview_timeout`, `doc_preview_timeout`
-   - `slave_node_retry`, `slave_ping_interval`, `slave_recover_interval`, `slave_transfer_timeout`
-   - `onedrive_monitor_timeout`, `onedrive_source_timeout`, `share_download_session_timeout`, `onedrive_callback_check`
-   - `mail_activation_template`, `mail_reset_pwd_template`
-   - `appid`, `appkey`（QQ 互联）
-   - `wechat_*`（微信支付系列）
-   - `hot_share_num`, `defaultTheme`, `theme_options`
-   - `max_worker_num`, `max_parallel_transfer`, `secret_key`
-   - `avatar_size_m`, `avatar_size_s`
-   - `home_view_method`, `share_view_method`, `cron_recycle_upload_session`
-   - `captcha_TCaptcha_*`, `initial_files`, `office_preview_service`
-   - `phone_required`, `phone_enabled`
-   - `custom_payment_*`
+1. **noopMigrator（丢弃）**：约 40 项 V3 设置直接跳过，不写入 V4
+2. **字段名变更**：`thumb_file_suffix`→`thumb_entity_suffix`，`wopi_session_timeout`→`viewer_session_timeout`
+3. **值转换**：`captcha_type` 将 `tcaptcha` 转 `normal`；`thumb_max_src_size` 一对多拆分为 5 个缩略图设置
+4. **直传**：未在 migrators 表中的设置，name/value 原样写入 V4
 
-2. **字段名变更**：
-   | V3 设置名 | V4 设置名 | 说明 |
-   |---|---|---|
-   | `thumb_file_suffix` | `thumb_entity_suffix` | 重命名 |
-   | `wopi_session_timeout` | `viewer_session_timeout` | 重命名 |
-
-3. **值转换**：
-   | V3 设置名 | 转换逻辑 |
-   |---|---|
-   | `captcha_type` | `tcaptcha` → `normal`，其他值保留 |
-   | `thumb_max_src_size` | 一对多：值同时写入 `thumb_music_cover_max_size`, `thumb_libreoffice_max_size`, `thumb_ffmpeg_max_size`, `thumb_vips_max_size`, `thumb_builtin_max_size` |
-
-4. **直传**：未在 `migrators` 表中的设置，name/value 原样写入 V4。
-
-5. **新增设置**：`hash_id_salt` 从 V3 配置文件 `System.HashIDSalt` 读取后插入。
+**新增设置**：`hash_id_salt` 从 V3 配置文件 `System.HashIDSalt` 读取后插入。
 
 ### 2.8 Share 分享
 
 **V3 模型**：[model/share.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/share.go)
+**迁移函数**：[share.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/share.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -266,6 +228,7 @@ Master 节点额外赋予 `NodeCapabilityExtractArchive` + `NodeCapabilityCreate
 ### 2.9 DirectLink 直链（SourceLink）
 
 **V3 模型**：[model/source_link.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/source_link.go)
+**迁移函数**：[directlink.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/directlink.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -278,6 +241,7 @@ Master 节点额外赋予 `NodeCapabilityExtractArchive` + `NodeCapabilityCreate
 ### 2.10 WebDAV 账户
 
 **V3 模型**：[model/webdav.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/webdav.go)
+**迁移函数**：[webdav.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/webdav.go)
 
 | V3 字段 | V4 字段 | 映射说明 |
 |---|---|---|
@@ -298,170 +262,328 @@ Master 节点额外赋予 `NodeCapabilityExtractArchive` + `NodeCapabilityCreate
 |---|---|
 | `{avatar_path}/avatar_{uid}_2.png` | `{data_path}/avatar/avatar_{uid}.png` |
 
-`avatar_path` 来自 V3 设置 `avatar_path`，通过 `util.RelativePath()` 解析。
-
 ---
 
 ## 3. Entity 实体创建
 
-V4 引入了 `Entity` 概念，代表存储后端中的实际数据对象。每个 V3 文件在迁移时会创建 1~2 个 Entity：
+V4 引入了 `Entity` 概念，代表存储后端中的实际数据对象。每个 V3 文件在迁移时会创建 1~2 个 Entity。
 
 ### 3.1 insertEntity 函数
 
-定义在 [file.go#L160-L189](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/file.go#L160-L189)，逻辑如下：
+定义在 [file.go#L160-L189](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/file.go#L160-L189)，去重逻辑：
 
 ```
-输入: source(存储路径), entityType, policyID, createdBy, size
-entityKey = policyID + "+" + source
+entityKey = strconv.Itoa(policyID) + "+" + source
 
-1. 查找 EntitySources 缓存中是否已存在同 key 的 Entity
-   - 如果存在：更新该 Entity 的 reference_count +1，返回
-   - 如果更新失败：降级为创建新 Entity
-2. 创建新 Entity：
-   - Source = source
-   - Type = entityType
-   - Size = size
-   - StoragePolicyEntities = policyID
-   - CreatedBy = createdBy
-   - ReferenceCount = 1
-3. 将新 Entity ID 写入 EntitySources 缓存
+1. 在 EntitySources 缓存中查找
+   - 找到：reference_count +1，返回现有 Entity
+   - 更新失败：降级为创建新 Entity
+2. 创建新 Entity（Source / Type / Size / StoragePolicyEntities / CreatedBy / ReferenceCount=1）
+3. 写入 EntitySources 缓存
 ```
 
 ### 3.2 文件迁移时的 Entity 创建流程
 
 对每个 V3 文件：
-
-1. **缩略图 Entity**（条件创建）：
-   - 条件：`metadata["thumb_status"] == "exist"`
-   - Source = `SourceName + ThumbSuffix`
-   - Type = `EntityTypeThumbnail`
-   - Size：本地策略时尝试 `os.Stat` 获取文件大小，否则为 0
-
-2. **版本 Entity**（必定创建）：
-   - Source = `SourceName`
-   - Type = `EntityTypeVersion`
-   - Size = `f.Size`
-
-3. **File 实体**：
-   - `PrimaryEntity` = 版本 Entity ID
-   - `AddEntities` = [版本 Entity, 缩略图 Entity(如有)]
+1. **缩略图 Entity**（条件：metadata 中 `thumb_status == "exist"`）
+2. **版本 Entity**（必定创建，Type = `EntityTypeVersion`）
+3. **File 实体**关联两个 Entity，`PrimaryEntity` 指向版本 Entity
 
 ---
 
-## 4. 幂等处理
+## 4. 恢复语义深度分析
 
-### 4.1 步骤级幂等
+### 4.1 一次性步骤 vs 批量步骤：重试行为核心差异
 
-[migrator.go#L180-L309](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L180-L309) 中，`Migrate()` 方法通过 `if m.state.Step <= StepXxx` 检查确保：
-- 已完成的步骤不会重复执行
-- 当前步骤失败后重试时，从当前步骤继续
+迁移步骤分为两大类，重试时的行为有本质区别。
 
-### 4.2 批次级幂等（offset 机制）
+#### 4.1.1 一次性步骤
 
-大数据量表（User、Folder、File、Share、DirectLink、Webdav）采用分批迁移 + offset 记录：
-- 每批 1000 条，批次完成后 `saveState()` 持久化 offset
-- 恢复时从上次保存的 offset 开始查询，跳过已处理的数据
+一次性步骤是指**整个步骤作为一个逻辑单元**，要么整体完成，要么整体失败后重试整个步骤。
 
-### 4.3 Entity 去重
+| 步骤 | 事务保护 | 重试起点 | 重试是否安全 | 关键风险点 |
+|---|---|---|---|---|
+| StepSchema | Ent 内置 | 重新执行 | ✅ 安全 | Schema.Create 是幂等的（CREATE TABLE IF NOT EXISTS） |
+| StepSettings | 单事务 | 重新执行整步 | ⚠️ 有条件安全 | 事务提交前失败→回滚安全；提交后失败→主键冲突 |
+| StepPolicy | 单事务 | 重新执行整步 | ⚠️ 有条件安全 | 同上；含远程策略时会同时创建 Node，也在事务内 |
+| StepNode | 无事务 | 重新执行整步 | ❌ 不安全 | 逐个创建 RawID，中途失败后重试 → 第一条就主键冲突 |
+| StepGroup | 无事务 | 重新执行整步 | ❌ 不安全 | 同上，逐个创建 RawID |
+| StepAvatar | 文件操作 | 重新复制全部 | ✅ 覆盖式安全 | 文件复制会覆盖，不会冲突 |
 
-`EntitySources` 缓存（`map[string]int`，key = `policyID+source`）确保相同存储路径的 Entity 不会重复创建，而是增加引用计数。
+**无事务一次性步骤的致命问题**：
+以 `migrateNode` 为例（[node.go#L22-L86](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/node.go#L22-L86)）：
+- 循环逐个 `Create().SetRawID()`，不使用事务
+- 假设迁移到第 3 个节点失败，前 2 个已写入数据库
+- `state.Step` 仍为 `StepNode`（因为 `updateStep` 在整步完成后才调用）
+- 重试时从第 1 个节点开始执行，第 1 个就会因主键冲突报错
+- 用户看到的错误是"创建节点失败"，但实际原因是之前部分成功的残留
 
-### 4.4 文件冲突处理
+**有事务一次性步骤的风险窗口**：
+以 `migrateSettings` 为例（[settings.go#L182-L210](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/settings.go#L182-L210)）：
+```
+事务提交成功 → updateStep(StepNode) 失败
+   ↓
+数据已写入 V4，但 Step 仍为 StepSettings
+   ↓
+重试时重新执行 migrateSettings
+   ↓
+name 唯一约束冲突（hash_id_salt 或其他设置）
+```
+这个时间窗口很小但存在。
 
-[file.go#L129-L139](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/file.go#L129-L139) 中：
-- 如果创建文件时遇到约束错误（`ent.IsConstraintError`），记录到 `FileConflictRename` 映射
-- 重命名为 `{原ID}_{原名}`，然后 **跳出当前批次**（`continue out`），下一批重试时使用新名称
-- 如果重命名后仍冲突，直接报错要求手动处理
+#### 4.1.2 批量步骤
 
-### 4.5 关联检查
+批量步骤是指**数据分批处理**，每批独立事务，失败后从最后一个成功批次的末尾继续。
 
-文件/文件夹/分享/直链/WebDAV 迁移时，会检查关联的 User、Folder、Policy 是否已存在于 state 缓存中，不存在则跳过该条记录并打印 Warning。
+| 步骤 | 错误时 saveState? | 每批事务 | 重试起点 | 数据一致性 |
+|---|---|---|---|---|
+| StepUser | ✅ 是 | 每批一事务 | UserOffset | 精确（按 offset） |
+| StepFolders | ✅ 是 | 每批一事务 | FolderOffset | 精确（按 offset） |
+| StepFolderParent | ❌ 否 | 每批一事务 | FolderParentOffset | 精确（按 offset） |
+| StepFile | ❌ 否 | 每批一事务 | FileOffset | 精确（按 offset） |
+| StepShare | ❌ 否 | 每批一事务 | ShareOffset | 精确（按 offset） |
+| StepDirectLink | ❌ 否 | 每批一事务 | DirectLinkOffset | 精确（按 offset） |
+| StepWebdav | ❌ 否 | 每批一事务 | WebdavOffset | 精确（按 offset） |
 
-### 4.6 PostgreSQL 序列重置
+**批量步骤的标准执行序列**（以 migrateUser 为例）：
 
-每个有批量迁移的实体完成后，如果是 PostgreSQL 数据库，执行 `SELECT SETVAL(...)` 重置自增序列，确保后续插入不会 ID 冲突。
+```
+for {
+    查询 V3 数据（offset, batchSize=1000）
+    开始事务
+    循环创建 1000 个用户（SetRawID）
+         ↓ 出错 → Rollback → return error
+    提交事务
+    offset += 1000
+    state.UserOffset = offset
+    saveState()  ← 状态持久化点
+}
+整步完成 → updateStep(StepFolders)
+```
+
+**关键保证**：
+- 每批事务原子性：批次内要么全成功要么全失败
+- 状态持久化在事务提交之后：不会出现"状态已前进但数据未写入"
+- 失败时当前批次回滚 + offset 不更新：恢复后从同一批重新开始，不会重复也不会丢数据
+
+**User/Folders 的额外 saveState**：
+在 [migrator.go#L231-L233](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L231-L233) 和 [migrator.go#L243-L245](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L243-L245)：
+```go
+if err := m.migrateUser(); err != nil {
+    m.saveState()  // 错误返回前再保存一次
+    return err
+}
+```
+这是为了确保 `UserIDs`/`FolderIDs` 集合等内存状态也被持久化（虽然 offset 已经在每批后保存了）。其他批量步骤没有这个额外 saveState，因为它们的 state 变化主要就是 offset。
+
+#### 4.1.3 对比总结
+
+| 维度 | 一次性步骤（有事务） | 一次性步骤（无事务） | 批量步骤 |
+|---|---|---|---|
+| 原子性 | 全步原子 | 逐条写入 | 每批原子 |
+| 失败后残留 | 无（回滚） | 已创建的实体残留 | 已提交批次保留 |
+| 重试安全性 | 大部分安全（提交后窗口除外） | 完全不安全 | 安全 |
+| 恢复精度 | 整步重做 | 整步重做但必失败 | 精确到批次 |
+| 状态更新时机 | 整步完成后 | 整步完成后 | 每批完成后 |
 
 ---
 
-## 5. 中断恢复机制
+### 4.2 force-reset 的实际影响范围
 
-### 5.1 State 状态文件
+`--force-reset` 标志定义在 [cmd/migrate.go#L22](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/cmd/migrate.go#L22)，实现非常简单（[cmd/migrate.go#L47-L53](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/cmd/migrate.go#L47-L53)）：
 
-定义在 [migrator.go#L21-L41](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L21-L41)，持久化为 `migration_state.json`，存放在 V3 配置文件同目录。
+```go
+if forceReset && util.Exists(stateFilePath) {
+    logger.Info("Force resetting migration state. Will start from the beginning.")
+    if err := os.Remove(stateFilePath); err != nil {
+        // ...
+    }
+}
+```
 
-State 结构体关键字段：
+#### 4.2.1 force-reset 只做一件事
 
-| 字段 | 用途 |
-|---|---|
-| `Step` | 当前迁移步骤编号 |
-| `UserOffset` / `FolderOffset` / `FileOffset` / `ShareOffset` / `DirectLinkOffset` / `WebdavOffset` / `FolderParentOffset` | 各批次迁移的当前偏移量 |
-| `PolicyIDs` | 已迁移的策略 ID 集合 |
-| `LocalPolicyIDs` | 已迁移的本地策略 ID 集合 |
-| `UserIDs` | 已迁移的用户 ID 集合 |
-| `FolderIDs` | 已迁移的文件夹 ID 集合 |
-| `EntitySources` | Entity 去重缓存，key="policyID+source", value=Entity ID |
-| `LastFolderID` | 最大文件夹 ID，用于文件 ID 偏移 |
-| `FileConflictRename` | 文件冲突重命名映射 |
-| `ThumbSuffix` | V3 缩略图文件后缀 |
-| `V3AvatarPath` | V3 头像存储路径 |
+**删除 `migration_state.json` 文件**，仅此而已。
 
-### 5.2 恢复流程
+#### 4.2.2 force-reset 不会做的事
 
-1. **启动时**（[migrator.go#L90-L133](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L90-L133)）：
-   - 检查 `migration_state.json` 是否存在
-   - 存在则加载 state，打印恢复信息（步骤名、offset）
-   - 不存在则从 `StepInitial` 开始
+| 资源 | 是否被清理 | 说明 |
+|---|---|---|
+| V4 数据库表结构 | ❌ 保留 | Schema 完全不动 |
+| V4 数据库中的数据 | ❌ 全部保留 | 已迁移的用户、文件、设置等全部保留 |
+| 已复制的头像文件 | ❌ 保留 | 文件系统操作不回滚 |
+| V3 数据库 | ❌ 完全不碰 | 迁移是只读 V3 |
+| V3 配置文件 | ❌ 保留 | 只读 |
 
-2. **执行中**：
-   - 每个步骤完成后调用 `updateStep()` 更新 Step 并保存 state
-   - 批量步骤中每批完成后调用 `saveState()` 保存 offset
-   - 用户/文件夹迁移错误时先 `saveState()` 再返回 error
+#### 4.2.3 force-reset 后重新运行各步骤的行为
 
-3. **失败时**：
-   - 命令行提示用户可用相同命令重试，将从上次保存点继续
-   - `--force-reset` 标志可删除 state 文件从头开始
+假设之前已经跑了一部分，现在 force-reset 后重新运行：
 
-### 5.3 saveState / loadState
+| 步骤 | 结果 | 原因 |
+|---|---|---|
+| StepSchema | ✅ 成功 | Ent Schema.Create 幂等（表已存在就跳过） |
+| StepSettings | ❌ 失败 | `hash_id_salt` 或其他设置的 `name` 唯一索引冲突 |
+| StepNode | ❌ 失败 | RawID 主键冲突（第一个节点就报错） |
+| StepPolicy | 分情况 | 之前整步未完成（事务未提交）→ 安全；之前已完成 → ID 冲突 |
+| StepGroup | ❌ 失败 | RawID 主键冲突（第一个组就报错） |
+| StepUser | ❌ 失败 | RawID 主键冲突 |
+| StepFolders | ❌ 失败 | RawID 主键冲突 |
+| 后续步骤 | ❌ 失败 | 依赖前面步骤的数据，且 RawID 冲突 |
 
-- `saveState`：JSON 序列化 State → 写入文件
-- `loadState`：读取文件 → JSON 反序列化到 State
-- `updateStep`：更新 Step 值 + saveState
+> ⚠️ **重要结论**：`--force-reset` 的命名有误导性。它不是"重置迁移"，只是"重置状态文件"。如果任何写入步骤已经部分或全部完成，force-reset 后重新运行**必然失败**。必须手动清空 V4 数据库（或重建数据库）才能真正从头开始迁移。
 
-### 5.4 注意事项
+#### 4.2.4 force-reset 的正确使用场景
 
-- **非精确幂等**：offset 机制基于查询偏移量而非主键，如果迁移过程中 V3 数据有增删，恢复后可能跳过或重复部分数据
-- **事务保护**：每批数据在事务中处理，事务失败会回滚当前批次，但 state 的 offset 可能在部分成功时未更新（设计意图是重新处理该批）
-- **User/Folder 错误时主动 saveState**：确保错误发生时已迁移的 ID 集合被保存，恢复后不再重复插入
-- **文件冲突导致整个批次重试**：`continue out` 跳出内层循环，offset 未增加，下次从同一批开始，但 `FileConflictRename` 已记录冲突文件的新名称
+只有一种场景是安全的：
+- 迁移还没开始或只跑了 `StepSchema`（Schema 幂等）
+- 想重新从 `StepSettings` 开始（但 V4 settings 表必须是空的）
 
----
-
-## 6. V3 配置初始化
-
-V3 数据库连接通过 [conf/conf.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/conf/conf.go) 和 [model/init.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/init.go) 初始化：
-
-1. `conf.Init()` 读取 V3 的 INI 配置文件，映射到 `DatabaseConfig`、`SystemConfig` 等结构体
-2. `model.Init()` 根据数据库类型（sqlite/mysql/postgres/mssql）创建 GORM 连接
-3. 兼容 `sqlite3`→`sqlite`，`mariadb`→`mysql`
+其他所有场景下，force-reset 后重试都会失败。
 
 ---
 
-## 7. 未迁移的 V3 数据
+### 4.3 状态持久化的完整时序
 
-以下 V3 模型存在但无对应迁移逻辑：
+State 保存发生在以下时机：
+
+| 时机 | 保存内容 | 对应代码 |
+|---|---|---|
+| 每步成功后 | Step 前进 + 当前 step 的 state | `updateStep()` |
+| 批量步骤每批成功后 | offset + 各 ID 集合 | `saveState()` |
+| User/Folders 步骤错误时 | 当前内存中的 state | `m.saveState()` 后 return |
+| 构造函数中加载 | 从文件读取 state | `loadState()` |
+
+**状态文件位置**：与 V3 配置文件同目录，文件名为 `migration_state.json`。
+
+---
+
+## 5. 占位字段与未接入迁移范围
+
+迁移代码中有多层占位设计，核心目的是保证社区版和 Pro 版的 `state` 文件格式兼容，以及未来扩展时不打乱步骤顺序。
+
+### 5.1 Step 占位
+
+在 [migrator.go#L57-L58](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/migrator.go#L57-L58) 定义了两个步骤占位：
+
+| 占位常量 | 值 | 推测对应 Pro 功能 | 社区版行为 |
+|---|---|---|---|
+| `Step_CommunityPlaceholder1` | 12 | 礼品码（Gift Code）迁移 | 在 Migrate() 中无代码，自动跳过 |
+| `Step_CommunityPlaceholder2` | 13 | 容量包（Storage Pack）迁移 | 在 Migrate() 中无代码，自动跳过 |
+
+**工作原理**：
+- 社区版的 `Migrate()` 中，`StepDirectLink` (11) 之后直接到 `StepAvatar` (14)
+- 因为 `if m.state.Step <= StepXxx` 的判断方式，步骤编号 12 和 13 自然被跳过
+- Pro 版可以在这两个槽位插入自己的迁移函数，而不需要改步骤编号
+- 这样社区版和 Pro 版的 state 文件中 Step 数字含义一致，可以互换
+
+### 5.2 State 字段占位
+
+State 结构体中有两个 offset 字段在社区版完全未使用：
+
+| State 字段 | 类型 | 推测对应 | 对应步骤 |
+|---|---|---|---|
+| `GiftCodeOffset` | int | 礼品码迁移批次偏移 | Step_CommunityPlaceholder1 |
+| `StoragePackOffset` | int | 容量包迁移批次偏移 | Step_CommunityPlaceholder2 |
+
+**证据链**：
+- V4 inventory 中有 `CreateStoragePackArgs` 类型（[inventory/user.go#L131-L136](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/inventory/user.go#L131-L136)）
+- V4 错误码中有 `CodeInvalidGiftCode = 40065`（[pkg/serializer/error.go#L211](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/pkg/serializer/error.go#L211)）
+- 但 V3 migrator 的 model 目录中**没有** gift_code 或 storage_pack 模型定义
+- 说明 Pro 版的 V3 有这些表，社区版 V3 没有
+
+### 5.3 权限/能力位占位
+
+除了迁移步骤外，V4 的权限和能力位枚举中也有 Community 占位：
+
+**用户组权限占位**（[types.go#L254-L260](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/inventory/types/types.go#L254-L260)）：
+
+```
+GroupPermission_CommunityPlaceholder1  // 位置 8
+GroupPermission_CommunityPlaceholder2  // 位置 10
+GroupPermission_CommunityPlaceholder3  // 位置 13
+GroupPermission_CommunityPlaceholder4  // 位置 14
+```
+
+**节点能力位占位**（[types.go#L271](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/inventory/types/types.go#L271)）：
+
+```
+NodeCapability_CommunityPlaceholder   // 位置 4
+```
+
+这些占位与迁移不直接相关，但体现了同一设计思路：在社区版代码中预留槽位，让 Pro 版可以填充对应功能而不打乱枚举编号。
+
+### 5.4 社区版未接入迁移的完整清单
+
+#### 5.4.1 V3 有模型但完全未迁移
 
 | V3 模型 | 文件 | 说明 |
 |---|---|---|
 | `Tag` | [model/tag.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/tag.go) | 用户自定义标签（文件分类/目录直达） |
 | `Task` | [model/task.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/task.go) | 异步任务记录 |
-| `User.Authn` | model/user.go | WebAuthn 凭据 |
-| `User.Options` | model/user.go | 用户个性化配置 |
-| `File.PicInfo` | model/file.go | 图片信息 |
-| `Policy.AutoRename` | model/policy.go | 自动重命名 |
-| `Policy.IsOriginLinkEnable` | model/policy.go | 原始链接启用 |
-| `Share.PreviewEnabled` | model/share.go | 预览启用 |
-| `Share.SourceName` | model/share.go | 搜索用字段 |
-| `Node.MasterKey` | model/node.go | 从→主通信密钥 |
+
+#### 5.4.2 部分字段未迁移
+
+| V3 来源 | 未迁移字段 | 原因推测 |
+|---|---|---|
+| User | `Authn` | V4 有独立的 Passkey 表，但迁移未做映射 |
+| User | `Options`/`OptionsSerialized` | V4 用户设置体系可能已重构 |
+| File | `PicInfo` | 元数据字段，可能已整合到 Entity/Metadata |
+| File | `UploadSessionID` | 上传会话，迁移时已失效 |
+| Policy | `AutoRename` | V4 策略体系可能有变化 |
+| Policy | `IsOriginLinkEnable` | 功能已变更 |
+| Policy | `OptionsSerialized.MimeType` | 已废弃或整合 |
+| Policy | `OptionsSerialized.PlaceholderWithSize` | 已废弃或整合 |
+| Group | `OptionsSerialized.OneTimeDownload` | 功能已变更 |
+| Share | `PreviewEnabled` | V4 分享体系可能有变化 |
+| Share | `SourceName` | 搜索用字段，可能由 File.Name 替代 |
+| Node | `MasterKey` | 主从通信架构变化 |
+| Node | `Aria2OptionsSerialized.Interval` | 配置体系变化 |
+| Node | `Aria2OptionsSerialized.Timeout` | 配置体系变化 |
+
+#### 5.4.3 被丢弃的系统设置（noopMigrator）
+
+通过 `noopMigrator` 直接丢弃的 40+ 项设置，分类：
+
+| 类别 | 设置项 |
+|---|---|
+| 站点外观 | `siteKeywords`、`defaultTheme`、`theme_options`、`home_view_method`、`share_view_method` |
+| 会话超时 | `download_timeout`、`preview_timeout`、`doc_preview_timeout`、`share_download_session_timeout`、`over_used_template` |
+| 从节点管理 | `slave_node_retry`、`slave_ping_interval`、`slave_recover_interval`、`slave_transfer_timeout` |
+| OneDrive | `onedrive_monitor_timeout`、`onedrive_source_timeout`、`onedrive_callback_check` |
+| 邮件 | `mail_activation_template`、`mail_reset_pwd_template` |
+| 第三方登录/支付 | `appid`、`appkey`（QQ互联）、`wechat_*`（微信支付，6项）、`custom_payment_*`（3项）、`captcha_TCaptcha_*`（4项） |
+| 其他功能 | `hot_share_num`、`max_worker_num`、`max_parallel_transfer`、`secret_key`（V4 有单独的 secret_key 迁移逻辑）、`avatar_size_m`、`avatar_size_s`、`cron_recycle_upload_session`、`initial_files`、`office_preview_service`、`phone_required`、`phone_enabled` |
+
+---
+
+## 6. 幂等处理机制汇总
+
+### 6.1 多层次幂等设计
+
+| 层级 | 机制 | 覆盖范围 |
+|---|---|---|
+| 步骤级 | `Step` 编号 + `if step <=` 判断 | 整步骤不重复执行 |
+| 批次级 | `offset` 偏移量记录 | 批量步骤不重复处理已成功批次 |
+| 实体级 | `EntitySources` 缓存（policyID+source 唯一键） | 相同存储路径的 Entity 不重复创建，引用计数+1 |
+| 冲突处理 | `FileConflictRename` 映射 | 同名文件自动重命名后重试 |
+| 关联校验 | `UserIDs`/`FolderIDs`/`PolicyIDs` 集合校验 | 跳过关联缺失的记录 |
+
+### 6.2 幂等性的局限
+
+1. **V3 数据变更风险**：offset 基于查询偏移量，而非主键 ID。如果迁移过程中 V3 数据库有增删操作，恢复后可能重复或遗漏数据。
+2. **无事务一次性步骤**：Node 和 Group 迁移中途失败后无法安全重试。
+3. **事务提交与状态保存的时间差**：理论上存在"事务已提交但 state 未写入"的窗口（极小概率）。
+4. **force-reset 假象**：只清状态不清数据，导致重试必败。
+
+---
+
+## 7. V3 配置初始化
+
+V3 数据库连接通过 [conf/conf.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/conf/conf.go) 和 [model/init.go](file:///d:/fz/0601-1/solo-dogfeeding/code/48-Cloudreve/application/migrator/model/init.go) 初始化：
+
+1. `conf.Init()` 读取 V3 的 INI 配置文件，映射到 `DatabaseConfig`、`SystemConfig` 等结构体
+2. `model.Init()` 根据数据库类型创建 GORM 连接
+3. 兼容 `sqlite3`→`sqlite`，`mariadb`→`mysql`
 
 ---
 
@@ -473,3 +595,7 @@ V3 数据库连接通过 [conf/conf.go](file:///d:/fz/0601-1/solo-dogfeeding/cod
 4. **两阶段文件夹迁移**：先创建文件夹（无父级），再批量设置父级关系，避免外键约束冲突
 5. **设置迁移表驱动**：通过 `migrators` map 实现声明式的设置转换规则
 6. **远程策略自动建节点**：V3 远程存储策略在 V4 中需要关联 Slave Node，迁移时自动创建
+7. **步骤槽位预留**：通过 CommunityPlaceholder 占位步骤，确保社区版与 Pro 版迁移状态兼容
+8. **状态文件外置**：状态文件与 V3 配置文件同目录，不依赖 V4 数据库，便于独立管理
+9. **批量步骤事务保证**：每批独立事务，offset 在事务提交后更新，确保恢复时不丢不重
+10. **部分步骤缺少事务保护**：Node 和 Group 迁移为无事务逐条写入，失败后无法安全重试
