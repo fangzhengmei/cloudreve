@@ -608,6 +608,383 @@ func NewShareUri(id, password string) string {
 
 ---
 
+#### 端到端完整流程梳理：从文件管理入口到 File not found 错误
+
+当所有者请求 `GET /share/:id?owner_extended=true` 且未传密码时，整个流程从 ShareInfoService 开始，经过文件管理系统的 7 层调用，最终密码错误被包装成 404。以下是逐层的详细状态和代码位置：
+
+```
+======================================================================
+STEP 0: 入口 ShareInfoService.Get()  [service/share/visit.go:60-112]
+======================================================================
+上下文：
+  - 当前用户 u = 分享所有者（已通过认证）
+  - 请求参数：id = "<hashid>", owner_extended = true, password = ""（空）
+  - 分享记录：已从数据库查到，share.Password = "abc123"
+
+执行流程：
+  1. 第 75 行：inventory.IsValidShare(share) → ✅ 通过
+     （检查时间过期、下载次数、所有者状态、源文件有效性）
+
+  2. 第 83-87 行：密码校验（服务层）
+     if s.Password == "" || ...  ← s.Password = ""
+        && share.Edges.User.ID != u.ID  ← false（所有者本人）
+     → 条件不满足，不进密码校验分支
+     → unlocked = true （所有者豁免）
+
+  3. 第 90 行：BuildShare(share, ..., unlocked=true, expired=false)
+     → 返回解锁态详情，res.Password = "abc123"（真实密码可见）
+
+  4. 第 93 行：进入 OwnerExtended 分支
+     ┌───────────────────────────────────────────────────────────────┐
+     │ 关键点：虽然第 3 步 res.Password 已有真实密码，               │
+     │ 但第 98 行用的是请求参数 s.Password（空），不是 res.Password！│
+     └───────────────────────────────────────────────────────────────┘
+
+======================================================================
+STEP 1: 构造 Share URI  [service/share/visit.go:97-101]
+======================================================================
+代码：
+  97: shareUri, err := fs.NewUriFromString(fs.NewShareUri(res.ID, s.Password))
+  98:                               ↑ res.ID = "<hashid>", s.Password = ""
+
+调用 fs.NewShareUri(id, "")  [pkg/filemanager/fs/uri.go:357-362]:
+  func NewShareUri(id, password string) string {
+      if password != "" {
+          // cloudreve://{id}:{password}@share
+          return fmt.Sprintf("%s://%s:%s@%s", ...)
+      }
+      // 无密码分支 ← 走这里！
+      return fmt.Sprintf("%s://%s@%s",
+          constants.CloudreveScheme, id, constants.FileSystemShare)
+  }
+
+结果：
+  uriStr = "cloudreve://<hashid>@share"
+  ↳ URL 结构：scheme="cloudreve", userinfo="<hashid>", host="share"
+  ↳ userinfo 中只有 username，没有 password
+  ↳ 后续 path.Password() 将返回 ""
+
+调用 fs.NewUriFromString(uriStr)  [pkg/filemanager/fs/uri.go:44-59]:
+  → 解析成功，返回 *URI 对象
+
+======================================================================
+STEP 2: 创建 FileManager  [service/share/visit.go:94]
+======================================================================
+代码：
+  94: m := manager.NewFileManager(dep, u)
+
+调用 NewFileManager  [pkg/filemanager/manager/manager.go:152-171]:
+  → 创建 DBFS 文件系统，绑定当前用户 u（所有者）
+  → 内部 fs 字段 = dbfs.NewDatabaseFS(u, ...)
+
+DBFS 初始化  [pkg/filemanager/fs/dbfs/dbfs.go:45-66]:
+  type DBFS struct {
+      user         *ent.User     ← = 所有者 u
+      navigators   map[string]Navigator
+      fileClient   inventory.FileClient
+      shareClient  inventory.ShareClient  ← 用于后续查询分享
+      ...
+  }
+
+======================================================================
+STEP 3: 调用 manager.Get()  [service/share/visit.go:103]
+======================================================================
+代码：
+  103: root, err := m.Get(c, shareUri)
+       ↓
+调用 manager.operation.Get()  [pkg/filemanager/manager/operation.go:51-53]:
+  func (m *manager) Get(ctx context.Context, path *fs.URI, opts ...fs.Option) (fs.File, error) {
+      return m.fs.Get(ctx, path, opts...)  ← 直接转发给 DBFS.Get
+  }
+
+======================================================================
+STEP 4: DBFS.Get()  [pkg/filemanager/fs/dbfs/dbfs.go:371-407]
+======================================================================
+代码：
+  func (f *DBFS) Get(ctx context.Context, path *fs.URI, opts ...fs.Option) (fs.File, error) {
+      o := newDbfsOption()
+      for _, opt := range opts {
+          o.apply(opt)
+      }
+
+      // 获取对应导航器（根据 URI 类型选择不同的 Navigator）
+      navigator, err := f.getNavigator(ctx, path, o.requiredCapabilities...)
+      if err != nil {
+          return nil, err  ← 这里不会失败
+      }
+
+      // ... 设置 context ...
+
+      // 🔴 关键点：通过导航器获取文件
+      target, err := f.getFileByPath(ctx, navigator, path)
+      if err != nil {
+          // 🔴 第一次包装：增加上下文前缀
+          return nil, fmt.Errorf("failed to get target file: %w", err)
+      }
+      // ...
+  }
+
+调用 f.getNavigator()  [pkg/filemanager/fs/dbfs/dbfs.go:266-303]:
+  根据 URI 的 host 字段判断类型：
+  - host == "share" → 创建 shareNavigator
+    return newShareNavigator(path, f.user, f.shareClient, f.l, f.hasher), nil
+
+shareNavigator 初始化  [pkg/filemanager/fs/dbfs/share_navigator.go:98-111]:
+  type shareNavigator struct {
+      share       *ent.Share     ← 初始为 nil，Root() 时才查询
+      sharePath   *fs.URI        ← = "cloudreve://<hashid>@share"
+      user        *ent.User      ← = 所有者 u
+      shareClient inventory.ShareClient
+      hasher      hashid.Encoder
+      l           logging.Logger
+      shareRoot   fs.File        ← 初始为 nil，Root() 时才设置
+  }
+
+======================================================================
+STEP 5: DBFS.getFileByPath()  [pkg/filemanager/fs/dbfs/dbfs.go:684-701]
+======================================================================
+代码：
+  func (f *DBFS) getFileByPath(ctx context.Context, navigator Navigator, path *fs.URI) (*File, error) {
+      defer duration.ToLog(ctx, f.l, "Get object by path from dbfs", "path", path)()
+      file, err := navigator.To(ctx, path)  ← 🔴 调用 shareNavigator.To
+      if err != nil {
+          return file, err  ← 透传错误，不包装
+      }
+      return file, nil
+  }
+
+======================================================================
+STEP 6: shareNavigator.To()  [pkg/filemanager/fs/dbfs/share_navigator.go:181-218]
+======================================================================
+代码：
+  func (n *shareNavigator) To(ctx context.Context, path *fs.URI) (fs.File, error) {
+      var (
+          currentFsFile = n.shareRoot  ← 初始为 nil
+          paths         = lo.DropWhile(lo.WithoutEmpty(strings.Split(path.Path(), "/")),
+                              func(s string) bool { return s == "/" || s == "" })
+      )
+
+      // 🔴 关键点：如果 shareRoot 为空，先调用 Root() 初始化
+      if currentFsFile == nil {
+          shareRoot, err := n.Root(ctx, path)  ← 🔴 进入密码校验
+          if err != nil {
+              return nil, err  ← 透传错误
+          }
+          currentFsFile = shareRoot
+          // ... 缓存 shareRoot ...
+      }
+
+      // ... 遍历路径查找文件（如果是文件夹内的文件）...
+      // 本场景中 path 就是根路径，直接返回 shareRoot
+  }
+
+======================================================================
+STEP 7: shareNavigator.Root() - 密码校验失败点  [share_navigator.go:114-179]
+======================================================================
+代码：
+  func (n *shareNavigator) Root(ctx context.Context, path *fs.URI) (fs.File, error) {
+      // 从 URI 中提取 shareID 并解码
+      shareID := path.Name()  ← = "<hashid>"
+      id, err := n.hasher.Decode(shareID, hashid.ShareID)  ← 解码为数据库 ID
+      if err != nil {
+          return nil, ErrShareNotFound
+      }
+
+      // 查询分享记录（第二次查询数据库！第一次在 visit.go 第 67 行）
+      share, err := n.shareClient.GetByID(ctx, id, share.DefaultPreloads...)
+      if err != nil {
+          return nil, ErrShareNotFound
+      }
+
+      // 🔴 第一次校验：IsValidShare（分享本身有效性）
+      if err := inventory.IsValidShare(share); err != nil {
+          return nil, ErrShareNotFound
+      }
+      → ✅ 通过（时间、下载次数、所有者、源文件都没问题）
+
+      // 🔴 🔴 🔴 第二次校验：密码校验（所有者也不豁免！）
+      // 代码第 130-131 行：
+      if share.Password != "" && share.Password != path.Password() {
+          //   share.Password    = "abc123"  （数据库中的真实密码）
+          //   path.Password()   = ""        （URI 中没有密码，来自 s.Password = ""）
+          //   条件成立！密码不匹配！
+          return nil, ErrShareIncorrectPassword
+          //   ↳ Code:  40069 CodeIncorrectPassword
+          //   ↳ Msg:   "Incorrect share password"
+      }
+
+      // （不会执行到这里）
+      ...
+  }
+
+⚠️  关键点：
+  - 这里完全没有检查 n.user（当前用户）是否是所有者
+  - 即使 n.user == share.Edges.User（所有者本人），只要 URI 中没带密码，就会失败
+  - 而 visit.go 第 85 行的服务层密码校验是豁免所有者的
+  - 两层校验逻辑不一致！
+
+======================================================================
+STEP 8: 错误向上传递与包装
+======================================================================
+
+  层级 7: shareNavigator.Root()
+    → 返回 ErrShareIncorrectPassword (40069, "Incorrect share password")
+
+  层级 6: shareNavigator.To() 第 185 行
+    → return nil, err  （透传，不包装）
+
+  层级 5: DBFS.getFileByPath() 第 700 行
+    → return file, err  （透传，不包装）
+
+  层级 4: DBFS.Get() 第 406 行  ← 🔴 第一次包装
+    → return nil, fmt.Errorf("failed to get target file: %w", err)
+    现在错误链：
+      外层："failed to get target file"
+      内层：ErrShareIncorrectPassword (40069, "Incorrect share password")
+
+  层级 3: manager.operation.Get() 第 52 行
+    → return m.fs.Get(ctx, path, opts...)  （透传，不包装）
+
+  层级 2: ShareInfoService.Get() 第 103 行
+    → root, err := m.Get(c, shareUri)  （收到第一次包装后的错误）
+
+  层级 1: ShareInfoService.Get() 第 105 行  ← 🔴 第二次包装（完全掩盖）
+    → return nil, serializer.NewError(serializer.CodeNotFound, "File not found", err)
+    现在：
+      Code:  404 CodeNotFound  （错误码被篡改！）
+      Msg:   "File not found"   （错误信息被覆盖！）
+      Error: 第一次包装后的错误链（作为内部 cause，前端不可见）
+
+======================================================================
+STEP 9: 最终响应
+======================================================================
+
+  HTTP/1.1 200 OK
+  Content-Type: application/json
+
+  {
+    "code": 404,
+    "msg": "File not found",
+    "data": null
+  }
+
+  ⚠️ 用户感知：
+    - 第一层分享详情显示 Unlocked=true，Password="abc123"（密码可见）
+    - 但 SourceUri 缺失，提示"文件找不到"
+    - 完全意识不到是因为自己没传 password 参数导致的
+```
+
+**关键代码位置汇总表**：
+
+| 步骤 | 操作 | 文件 | 行号 |
+|-----|------|------|------|
+| STEP 0 | ShareInfoService 入口，所有者密码豁免 | [visit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/visit.go#L83-L87) | 83-87 |
+| STEP 1 | 构造无密码的 Share URI | [uri.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/uri.go#L357-L362) | 357-362 |
+| STEP 2 | 创建 FileManager + DBFS | [manager.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/manager/manager.go#L152-L171) | 152-171 |
+| STEP 3 | manager.Get 转发 | [operation.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/manager/operation.go#L51-L53) | 51-53 |
+| STEP 4 | DBFS.Get 调用 getFileByPath | [dbfs.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L371-L407) | 371-407 |
+| STEP 5 | getFileByPath 调用 navigator.To | [dbfs.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L684-L701) | 684-701 |
+| STEP 6 | shareNavigator.To 触发 Root 初始化 | [share_navigator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/share_navigator.go#L181-L218) | 181-218 |
+| STEP 7 | shareNavigator.Root 密码校验失败（所有者不豁免） | [share_navigator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/share_navigator.go#L130-L131) | 130-131 |
+| STEP 8 | DBFS.Get 第一次包装错误 | [dbfs.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L404-L406) | 406 |
+| STEP 8 | visit.go 第二次包装（掩盖为 404） | [visit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/visit.go#L103-L105) | 105 |
+
+**流程中的三处设计缺陷**：
+
+1. **不一致的密码豁免**：第 85 行服务层豁免所有者密码，第 130 行文件系统层不豁免
+2. **密码来源不一致**：第 90 行 `res.Password` 已有真实密码，但第 98 行仍用空的 `s.Password` 构造 URI
+3. **过度的错误掩盖**：密码错误应该返回 40069 提示用户输入密码，而不是 404 说文件不存在
+
+---
+
+#### 深度分析：从密码错误到 "File not found" 的完整包装链路
+
+当 `owner_extended=true` 遇到密码错误时，错误信息经过 **5 层调用栈、2 次包装**，最终的密码错误信息被完全掩盖。以下是逐层追踪的细节：
+
+```
+所有者请求 GET /share/:id?owner_extended=true  (不传 password)
+  │
+  │  第一层：ShareInfoService.Get()
+  │  ├─ 第 75 行：IsValidShare() → ✅ 通过
+  │  ├─ 第 85 行：密码校验 → 所有者豁免 → unlocked=true
+  │  ├─ 第 90 行：BuildShare() → ✅ 返回解锁态详情（含真实密码）
+  │  │
+  │  └─ 第 93 行：OwnerExtended 分支
+  │     │
+  │     ├─ 98: NewShareUri(res.ID, s.Password) → "cloudreve://<hashid>@share"  ← 无密码
+  │     │
+  │     └─ 103: m.Get(c, shareUri)
+  │             │
+  │             │  第二层：manager.operation.Get()  [operation.go:51-53]
+  │             │  └─ return m.fs.Get(ctx, path, opts...)  → 直接透传
+  │             │             │
+  │             │             │  第三层：DBFS.Get()  [dbfs.go:371-407]
+  │             │             │  ├─ 378: f.getNavigator(...) → 创建 shareNavigator ✅
+  │             │             │  ├─ 404: f.getFileByPath(ctx, navigator, path)
+  │             │             │  │   │
+  │             │             │  │   │  第四层：DBFS.getFileByPath()  [dbfs.go:684-701]
+  │             │             │  │   └─ 685: file, err := navigator.To(ctx, path)
+  │             │             │  │            │
+  │             │             │  │            │  第五层：share_navigator.To()  [share_navigator.go:181-218]
+  │             │             │  │            ├─ 182-189: shareRoot == nil → 调用 Root()
+  │             │             │  │            │   │
+  │             │             │  │            │   │  第六层：share_navigator.Root()  [share_navigator.go:114-179]
+  │             │             │  │            │   ├─ 118: GetByHashID() → ✅ 查到 share
+  │             │             │  │            │   ├─ 123: IsValidShare() → ✅ 通过
+  │             │             │  │            │   │
+  │             │             │  │            │   ├─ 🔴 130-131: 密码校验失败
+  │             │             │  │            │   │       share.Password = "abc123"
+  │             │             │  │            │   │       path.Password() = ""
+  │             │             │  │            │   │       不匹配！
+  │             │             │  │            │   │
+  │             │             │  │            │   └─ 返回 ErrShareIncorrectPassword
+  │             │             │  │            │       Code:  40069 CodeIncorrectPassword
+  │             │             │  │            │       Msg:   "Incorrect share password"
+  │             │             │  │            │       Error: nil
+  │             │             │  │            │
+  │             │             │  │            └─ 185: return nil, err  → 直接返回，不包装
+  │             │             │  │
+  │             │             │  └─ 700: return file, err  → 直接返回，不包装
+  │             │             │
+  │             │             ├─ 🔴 第一次包装（增加上下文前缀）：
+  │             │             │  406: return nil, fmt.Errorf("failed to get target file: %w", err)
+  │             │             │       外层："failed to get target file"
+  │             │             │       内层：ErrShareIncorrectPassword (40069, "Incorrect share password")
+  │             │             │
+  │             │             └─ 返回包装后的错误 ↑
+  │             │
+  │             └─ 返回透传的错误 ↑
+  │
+  └─ 🔴 第二次包装（完全掩盖原始错误）：
+     105: return nil, serializer.NewError(serializer.CodeNotFound, "File not found", err)
+          Code:  404 CodeNotFound
+          Msg:   "File not found"
+          Error: 第一次包装后的错误链（作为内部 cause）
+
+  └─ 🔚 最终接口响应：
+          { "code": 404, "msg": "File not found" }
+          ⚠️ 用户完全看不到任何与密码相关的提示！
+```
+
+**每一层错误处理的代码位置**：
+
+| 层级 | 文件 | 行号 | 处理方式 |
+|-----|------|------|---------|
+| 1 错误原点 | [share_navigator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/share_navigator.go#L130-L131) | 130-131 | 返回 `ErrShareIncorrectPassword` (40069) |
+| 2 透传 | [share_navigator.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/share_navigator.go#L184-L185) | 184-185 | `return nil, err` 不包装 |
+| 3 透传 | [dbfs.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L684-L700) | 685,700 | `return file, err` 不包装 |
+| 4 第一次包装 | [dbfs.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L404-L406) | 406 | `fmt.Errorf("failed to get target file: %w", err)` |
+| 5 透传 | [operation.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/pkg/filemanager/manager/operation.go#L51-L53) | 52 | `return m.fs.Get(ctx, path, opts...)` 不包装 |
+| 6 第二次包装 | [visit.go](file:///d:/fz/0601-1/solo-dogfeeding/code/43-Cloudreve/service/share/visit.go#L103-L105) | 105 | `serializer.NewError(CodeNotFound, "File not found", err)` → 错误码改为 404 |
+
+**关键问题点**：
+1. **错误码被篡改**：`CodeIncorrectPassword (40069)` → `CodeNotFound (404)`，前端无法区分是真的文件不存在还是密码错误
+2. **错误信息被覆盖**：`"Incorrect share password"` → `"File not found"`，用户看不到密码错误提示
+3. **内部 cause 无用**：虽然用 `%w` 保留了错误链，但 `serializer.NewError` 只会把 `Msg` 字段返回给前端，内部错误在响应中不可见
+4. **不一致的密码豁免**：同一请求中第 85 行所有者免密，第 130 行又要求密码
+
+---
+
 ### 9.3 失效判断（IsValidShare）和 过期判断（IsShareExpired）的区别，以及 Expired 标记的实际可达性
 
 两个函数的包含关系：`IsValidShare = IsShareExpired + 所有者状态检查 + 源文件状态检查`
