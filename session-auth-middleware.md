@@ -118,7 +118,7 @@ Store = sessionstore.NewStore(dep.KV(), []byte(sessionSecret))
 // - Secure: 跟随 CORS 配置
 ```
 
-**用途**：主要用于 CSRF 防护（`CSRFInit` / `CSRFCheck`），**不用于用户身份识别**。详见第九章分析。
+**用途**：主要用于 CSRF 防护（`CSRFInit` / `CSRFCheck`），**不用于用户身份识别**。详见第十章分析。
 
 #### 阶段三：CurrentUser — JWT Token 鉴权（[auth.go#L48-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/auth.go#L48-L71)）
 
@@ -1361,7 +1361,138 @@ GET /api/v4/file/list    (无 Authorization Header 或空字符串)
 **代码证据 — Session 中从未写入 UID**：
 搜索整个代码库，`sessions.Default(c)` 或 `sessions.GetMany` 的返回值调用 `.Set()` 只在 CSRF 相关代码里操作，没有写入 UID 的逻辑。Session 中间件创建后，**没有任何一行代码** 将用户 ID 写入 session store。
 
-### 8.5 Session 中间件 vs CurrentUser 中间件的职责划分
+### 10.5 Session 使用场景的全面分类与职责边界
+
+之前的结论（"Session 只用于 CSRF 防护"）需要更精确的表述。通过全局搜索 `util.SetSession`、`util.GetSession`、`util.DeleteSession` 的所有调用，session 的使用场景可以分为 **四类**，其中只有一类属于正式主链路，且均不涉及用户身份恢复：
+
+| 场景类型 | 具体用途 | 代码位置 | 是否参与正式鉴权链路 | 是否操作 UID |
+|---------|---------|---------|-------------------|-------------|
+| **主链路预留（未实际启用）** | CSRF 防护 | [session.go#L48-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/session.go#L48-L67) | ⚠️ 代码定义但路由未引用 | ❌ |
+| **测试辅助** | 单元测试模拟上下文 | [mock.go#L14-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/mock.go#L14-L24) | ❌ 仅测试环境 | ❌ |
+| **已注释废弃代码** | OAuth 回调状态传递 | [oauth.go](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/service/callback/oauth.go) | ❌ 已注释不运行 | ❌（存的是 policyID） |
+| **完全无关** | aria2 下载器会话 | `aria2.GetSessionInfo()` | ❌ 概念不同 | ❌ |
+
+#### 10.5.1 场景一：CSRF 防护（主链路预留但未实际启用）
+
+`CSRFInit` 和 `CSRFCheck` 虽然在 [middleware/session.go](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/session.go) 中明确定义：
+
+```go
+// CSRFInit 初始化CSRF标记 [session.go#L48-L54]
+func CSRFInit() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        util.SetSession(c, map[string]interface{}{"CSRF": true})  // 只写入 CSRF=true
+        c.Next()
+    }
+}
+
+// CSRFCheck 检查CSRF标记 [session.go#L56-L67]
+func CSRFCheck() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        if check, ok := util.GetSession(c, "CSRF").(bool); ok && check {  // 只读取 CSRF 字段
+            c.Next()
+            return
+        }
+        // ... 拒绝
+    }
+}
+```
+
+**关键事实**：在路由配置文件中全局搜索 `CSRFInit` 和 `CSRFCheck`，**没有找到任何引用**。这意味着这两个中间件虽然代码存在，但在 v4 版本的路由链中并未实际挂载。
+
+**即使启用也不影响结论**：
+- 只读写 `"CSRF"` 布尔字段，**从不操作 UID**
+- 不调用 `SetUserCtx`，**不注入 UserCtx**
+- 只是 CSRF 防护机制，与身份认证完全解耦
+
+#### 10.5.2 场景二：测试辅助（仅单元测试使用）
+
+`MockHelper` 是单元测试专用的辅助中间件，定义在 [middleware/mock.go#L14-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/mock.go#L14-L24)：
+
+```go
+// SessionMock 测试时模拟Session
+var SessionMock = make(map[string]interface{})
+
+// ContextMock 测试时模拟Context
+var ContextMock = make(map[string]interface{})
+
+// MockHelper 单元测试助手中间件
+func MockHelper() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        // 将全局变量 SessionMock 写入会话
+        util.SetSession(c, SessionMock)
+        // 将全局变量 ContextMock 写入 gin Context
+        for key, value := range ContextMock {
+            c.Set(key, value)
+        }
+        c.Next()
+    }
+}
+```
+
+**为什么不影响结论**：
+- **生产环境不启用**：测试代码不会编译到生产二进制中
+- **不是正常鉴权流程**：由测试代码主动设置全局变量 `SessionMock`，不是从 Cookie 中恢复
+- **操作内容可控**：测试者写入什么就是什么，不是真实的用户身份恢复机制
+
+#### 10.5.3 场景三：已注释的废弃代码（OAuth 回调）
+
+[service/callback/oauth.go](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/service/callback/oauth.go) 中的 Google Drive 和 OneDrive OAuth 回调代码已全部被 `//` 注释：
+
+```go
+//// GDriveAuth Google Drive 更新认证信息
+//func (service *OauthService) GDriveAuth(c *gin.Context) serializer.Response {
+//    // ...
+//    policyID, ok := util.GetSession(c, "googledrive_oauth_policy").(uint)  // 存的是 policyID，不是 UID
+//    // ...
+//    util.DeleteSession(c, "googledrive_oauth_policy")
+//    // ...
+//}
+```
+
+**为什么不影响结论**：
+- **代码不运行**：已被注释，不参与编译和执行
+- **存储的不是 UID**：即使曾经运行过，存储的是 `policyID`（存储策略ID），不是用户 ID
+- **用途不同**：用于 OAuth 授权回调时传递存储策略状态，不是用户身份认证
+
+#### 10.5.4 场景四：完全无关的 "session" 概念
+
+`aria2.GetSessionInfo()` 是 aria2 下载器的 RPC 调用，这里的 "session" 指下载器的会话状态，与用户鉴权 session 是完全不同的概念，不相关。
+
+#### 10.5.5 为什么所有这些场景都不影响核心结论
+
+**核心结论**：**空 Authorization 请求不会从 session 恢复身份**。
+
+无论 session 在其他场景如何被使用，这个结论都成立，原因有五层保障：
+
+| 保障层级 | 具体内容 | 代码证据 |
+|---------|---------|---------|
+| **第一层：CurrentUser 硬编码逻辑** | `CurrentUser` 是唯一负责全局用户身份注入的中间件，它**只读取 Authorization Header**，**从不读取 session** | [auth.go#L48-L71](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/auth.go#L48-L71) |
+| **第二层：没有写入 UID 的代码** | 全局搜索 `SetSession` 调用，**没有任何一行代码** 将用户 ID 写入 session store。即使想从 session 恢复，也没有 UID 可恢复 | 全局搜索结果 |
+| **第三层：CSRF 与身份解耦** | `CSRFInit`/`CSRFCheck` 只操作 `"CSRF"` 布尔值，从不涉及用户身份 | [session.go#L48-L67](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/session.go#L48-L67) |
+| **第四层：测试代码不进生产** | `MockHelper` 仅用于单元测试，生产环境不会启用 | [mock.go#L14-L24](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/middleware/mock.go#L14-L24) |
+| **第五层：废弃代码不运行** | OAuth 相关代码已被注释，不参与编译执行 | [oauth.go](file:///d:/fz/0601-1/solo-dogfeeding/code/44-Cloudreve/service/callback/oauth.go) |
+
+**最关键的逻辑链**：
+```
+空 Authorization 请求
+    │
+    ▼
+CurrentUser 中间件执行 [auth.go#L48-L71]
+    │
+    ├─ VerifyAndRetrieveUser: 只看 Authorization Header
+    │   空 Header → 不注入 UserIDCtx → uid = 0
+    │
+    └─ SetUserCtx(c, 0) → 构造 AnonymousUser
+    │
+    ▼
+后续业务代码通过 inventory.UserFromContext(c) 读取
+    │
+    └─ 得到 AnonymousUser（ID=0）
+```
+
+在这个流程中，**没有任何一步读取 session**。session 是否在其他地方被使用，与这个鉴权链路完全无关。
+
+### 10.6 Session 中间件 vs CurrentUser 中间件的职责划分
 
 ```
 Session Middleware  [session.go]
