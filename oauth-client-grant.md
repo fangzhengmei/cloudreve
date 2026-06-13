@@ -140,6 +140,69 @@ type AuthorizationCode struct {
 9. **更新 grant last_used_at**：记录本次使用时间
 10. **返回响应**：包含 `offline_access` scope 时才返回 refresh_token
 
+### 2.2.5 Grant 在授权确认到换 Token 之间的状态变化（补充）
+
+此前容易误解为：grant 在 token 交换成功后才正式建立。实际代码逻辑并非如此——**grant 在用户同意授权（consent）那一刻就已写入数据库**，与授权码是否被用来换取 token 完全独立。
+
+**关键时序拆解**：
+
+1. **T0：调用 `/oauth/consent` 之前**
+   - grant 可能不存在（首次授权），或已存在（再次授权）
+
+2. **T1：`GrantService.Get` 执行第 5 步 UpsertGrant**（[oauth.go](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/service/oauth/oauth.go#L99-L102) → [oauth_client.go](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/inventory/oauth_client.go#L100-L112)）
+   ```go
+   func (c *oauthClientClient) UpsertGrant(...) error {
+       return c.client.OAuthGrant.Create().
+           SetUserID(userID).SetClientID(clientID).
+           SetScopes(scopes).SetLastUsedAt(time.Now()).
+           OnConflict(sql.ConflictColumns(oauthgrant.FieldUserID, oauthgrant.FieldClientID)).
+           UpdateScopes().UpdateLastUsedAt().
+           Exec(ctx)
+   }
+   ```
+   - **首次授权**：INSERT 一条新 grant 记录，`scopes` = 请求的 scopes，`last_used_at` = 当前时间
+   - **再次授权**：ON CONFLICT UPDATE，覆盖 `scopes` 和 `last_used_at`
+   - 到这一步，grant 已经在数据库中**持久存在**
+
+3. **T2：授权码生成并写入 KV**（T1 之后，T1+10 分钟内有效）
+   - 授权码是独立的短期凭证（存放在 KV，TTL 600 秒）
+   - 它指向 grant，但 grant 本身不依赖授权码的存在
+
+4. **T3：授权码过期或未使用**
+   - KV 中的授权码自动失效（TTL 到期）
+   - **但 grant 不会被清理**，仍然保留在数据库中
+   - 下次用户再 consent，直接走 UPSERT 更新逻辑
+
+5. **T4：调用 `/oauth/token` 交换令牌（在 T1+10 分钟内）**
+   - 从 KV 取出授权码并**立即删除**（一次性）
+   - 校验成功后，在第 9 步调用 `UpdateGrantLastUsedAt`（[oauth.go](file:///d:/fz/0601-1/solo-dogfeeding/code/45-Cloudreve/service/oauth/oauth.go#L210-L213)）：
+     ```go
+     if err := oAuthClient.UpdateGrantLastUsedAt(c, user.ID, app.ID); err != nil {
+         dep.Logger().Warning("Failed to update grant last used at: %s", err)
+     }
+     ```
+   - 这一步**只更新 `last_used_at` 字段**，不修改 `scopes`
+   - 注意：如果更新失败，仅打 Warning 日志，**不会导致 token 签发失败**（非阻塞）
+
+**状态变化表**：
+
+| 时间点 | 操作 | grant.scopes | grant.last_used_at | 授权码状态 |
+|--------|------|--------------|-------------------|-----------|
+| T0 | consent 前 | 空（或旧值） | 空（或旧值） | 不存在 |
+| T1 | UpsertGrant | **设为请求的 scopes** | **设为当前时间** | 不存在 |
+| T1.5 | 授权码写入 KV | 不变 | 不变 | 存在（10分钟 TTL） |
+| T2 | 授权码过期 | 不变 | 不变 | 已失效 |
+| T4 | 交换 token 成功 | 不变 | **更新为当前时间** | 已删除 |
+| T4+ | refresh token 刷新 | 不变 | **更新为当前时间** | 不存在 |
+
+**核心结论**：
+- Grant 的创建和 scope 写入发生在 consent 阶段，不是 token 交换阶段
+- 即使授权码过期/被丢弃，grant 仍然存在且有效
+- Token 交换和后续 refresh 只更新 `last_used_at`，不改变 scope
+- Grant 一旦创建，只能通过显式删除（用户撤销 / 管理员删客户端）或 UPSERT 覆盖（再次 consent）来改变
+
+---
+
 ### 2.3 Token 签发与刷新
 
 #### Token 结构
