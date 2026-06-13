@@ -1,4 +1,4 @@
-# 远程下载任务代码分析
+﻿# 远程下载任务代码分析
 
 ## 1. 整体架构与代码路径
 
@@ -644,9 +644,9 @@ func (a *aria2Client) tempPath(ctx context.Context) string {
 
 qBittorrent 在 [qbittorrent.go:251-263](pkg/downloader/qbittorrent/qbittorrent.go#L251-L263) 同样调用 `filepath.Join` 生成路径，通过 `savepath` 字段传给 qBittorrent API。
 
-#### 阶段二：序列化到 SavePath（Info）
+#### 阶段二：序列化到 SavePath 和 file.Name（Info）
 
-当工作流调用 `Info()` 获取下载状态时，下载器将 RPC 返回的 `Dir` 转为正斜杠格式：
+当工作流调用 `Info()` 获取下载状态时，下载器将 RPC 返回的目录和文件名全部转为**正斜杠**格式，作为跨平台通用中间表示：
 
 Aria2（[aria2.go:130](pkg/downloader/aria2/aria2.go#L130)）：
 ```go
@@ -658,60 +658,164 @@ qBittorrent（[qbittorrent.go:210](pkg/downloader/qbittorrent/qbittorrent.go#L21
 SavePath: filepath.ToSlash(torrents[0].SavePath),
 ```
 
-**为什么用 `filepath.ToSlash`？** 因为 `SavePath` 和 `file.Name` 会被 JSON 序列化存入数据库（`PrivateState` 字段），跨平台传输时正斜杠是通用格式。特别是从机模式下，主机和从机的操作系统可能不同，正斜杠是安全的中间表示。
+> **为什么用 `filepath.ToSlash`？** 因为 `SavePath` 和 `file.Name` 会被 JSON 序列化存入数据库（`PrivateState` 字段），跨平台传输时正斜杠是通用格式。特别是从机模式下，主机和从机的操作系统可能不同，正斜杠是安全的中间表示。
 
-Aria2 的 `file.Name`（[aria2.go:148-152](pkg/downloader/aria2/aria2.go#L148-L152)）也用正斜杠相对路径：
+##### file.Name 的语义：含目录层级的相对路径，不是单个文件名
+
+`TaskFile.Name` 字段（[downloader.go:50-56](pkg/downloader/downloader.go#L50-L56)）在两个下载器中**均为包含目录层级的相对路径**，不是单个文件名：
+
+Aria2（[aria2.go:144-163](pkg/downloader/aria2/aria2.go#L144-L163)）：
 ```go
-relPath := strings.TrimPrefix(filepath.ToSlash(item.Path), savePath)
-if len(relPath) > 0 {
-    relPath = relPath[1:]  // 去掉前导 "/"
-}
+Files: lo.Map(status.Files, func(item rpc.FileInfo, index int) downloader.TaskFile {
+    relPath := strings.TrimPrefix(filepath.ToSlash(item.Path), savePath)
+    if len(relPath) > 0 {
+        relPath = relPath[1:]  // 去掉前导 "/"
+    }
+    return downloader.TaskFile{
+        Index:    index,
+        Name:     relPath,   // ← 如 "subdir/file.txt"，含目录层级
+        Size:     size,
+        Progress: progress,
+        Selected: item.Selected == "true",
+    }
+}),
 ```
 
-qBittorrent 的 `file.Name`（[qbittorrent.go:216](pkg/downloader/qbittorrent/qbittorrent.go#L216)）直接用 `filepath.ToSlash`：
+qBittorrent（[qbittorrent.go:213-221](pkg/downloader/qbittorrent/qbittorrent.go#L213-L221)）：
 ```go
-Name: filepath.ToSlash(item.Name),
+Files: lo.Map(files, func(item File, index int) downloader.TaskFile {
+    return downloader.TaskFile{
+        Index:    item.Index,
+        Name:     filepath.ToSlash(item.Name),  // ← torrent 内部相对路径，如 "ubuntu-22.04/subdir/file.txt"
+        Size:     item.Size,
+        Progress: item.Progress,
+        Selected: item.Priority > 0,
+    }
+}),
 ```
 
-> **注意 qBittorrent 与 Aria2 的 file.Name 语义差异**：
-> - Aria2：`file.Name` 是相对于 `SavePath` 的相对路径（去掉了前缀），如 `subdir/file.txt`
-> - qBittorrent：`file.Name` 是 torrent 内部的文件名（可能包含子目录），如 `torrent-name/subdir/file.txt`
+> **Aria2 vs qBittorrent 的 Name 差异**：
+> - Aria2：`item.Path` 是文件的绝对路径，用 `TrimPrefix(..., savePath)` 去掉 SavePath 前缀 → 得到相对 SavePath 的相对路径，如 `subdir/file.txt`
+> - qBittorrent：`item.Name` 就是 torrent 内部路径（包含种子根目录），如 `ubuntu-22.04/subdir/file.txt`
+
+**`file.Name` 含目录层级这件事至关重要**——它同时决定了源文件的磁盘定位和目标路径的落库位置，这两件事走了两条不同的处理链（见 11.3 节）。
 
 #### 阶段三：反序列化并在工作流中使用
 
 从 DB 反序列化后，`SavePath` 是正斜杠字符串，`file.Name` 也是正斜杠字符串。
 
-#### 阶段四：打开文件（masterTransfer / slaveTransfer）
 
-**主机节点**在 [remote_download.go:471](pkg/filemanager/workflows/remote_download.go#L471) 拼接并打开：
+#### 阶段四：file.Name 同时决定源文件定位和目标落库
+
+进入 Transfer 阶段后，同一个 `file.Name`（含目录层级的相对路径）被两条处理链分别使用一条决定源文件在磁盘上的定位路径，另一条决定目标文件在 Cloudreve 中的落库路径。
+
+##### 处理链 A：源文件定位（不做 sanitize，保留目录层级）
+
+`file.Name` 直接与 `SavePath` 拼接，用于从磁盘上打开下载好的文件。
+
+**主机节点**（[remote_download.go:471](pkg/filemanager/workflows/remote_download.go#L471)）：
 
 ```go
 src := filepath.FromSlash(path.Join(m.state.Status.SavePath, file.Name))
-// ↓ 在 Windows 上
-// path.Join("C:/cloudreve/data/aria2/uuid", "subdir/file.txt")
-//   → "C:/cloudreve/data/aria2/uuid/subdir/file.txt"  (POSIX 风格中间结果)
-// filepath.FromSlash(...)
-//   → "C:\cloudreve\data\aria2\uuid\subdir\file.txt"  (OS 原生路径)
-// os.Open(src)  → 用 OS 原生路径打开文件
+// 示例（Windows）：
+//   path.Join("C:/cloudreve/data/aria2/uuid", "subdir/file.txt")
+//      "C:/cloudreve/data/aria2/uuid/subdir/file.txt"   (POSIX 中间结果，目录层级被保留)
+//   filepath.FromSlash(...)
+//      "C:\cloudreve\data\aria2\uuid\subdir\file.txt"   (OS 原生路径)
+// os.Open(src)   用 OS 原生路径打开文件
 ```
 
-流程：`path.Join`（POSIX 拼接）→ `filepath.FromSlash`（转 OS 分隔符）→ `os.Open`。
-
-**从机节点**在 [remote_download.go:357](pkg/filemanager/workflows/remote_download.go#L357) 构建路径：
+**从机节点**（[remote_download.go:357](pkg/filemanager/workflows/remote_download.go#L357)）：
 
 ```go
 src := path.Join(m.state.Status.SavePath, f.Name)
-// ↓ 结果是纯 POSIX 正斜杠字符串，如 "C:/cloudreve/data/aria2/uuid/subdir/file.txt"
+//  正斜杠字符串，如 "C:/cloudreve/data/aria2/uuid/subdir/file.txt"（目录层级被保留）
 ```
 
 这个 POSIX 字符串通过 JSON 传给从机的 `SlaveUploadTask`，从机在 [upload.go:134](pkg/filemanager/workflows/upload.go#L134) 打开时才转换：
 
 ```go
 handle, err := os.Open(filepath.FromSlash(file.Src))
-// ↓ 在 Windows 上转为 "C:\cloudreve\data\aria2\uuid\subdir\file.txt"
+//  Windows 上转为 "C:\cloudreve\data\aria2\uuid\subdir\file.txt"
 ```
 
-**结论：两条路径最终效果一致，只是 `filepath.FromSlash` 的调用时机不同——主机在拼接时立即转换，从机在打开时才转换。**
+**关键：源文件定位链不调用 `sanitizeFileName`**。目录层级通过 `path.Join` 被完整保留，下载器把文件存在哪就从哪读。
+
+##### 处理链 B：目标落库（调用 sanitize，但保留 `/` 目录层级）
+
+同一个 `file.Name` 先经过 `sanitizeFileName`，再通过 `dstUri.JoinRaw` 拼接为目标 URI。
+
+**sanitizeFileName 不替换正斜杠 `/`**（[remote_download.go:681-684](pkg/filemanager/workflows/remote_download.go#L681-L684)）：
+
+```go
+func sanitizeFileName(name string) string {
+    r := strings.NewReplacer(
+        "\\", "_",   //  仅替换反斜杠为下划线
+        ":",  "_",
+        "*",  "_",
+        "?",  "_",
+        "\"", "_",
+        "<",  "_",
+        ">",  "_",
+        "|",  "_",
+    )
+    return r.Replace(name)
+}
+```
+
+| 字符 | 行为 | 影响 |
+|------|------|------|
+| `/`（正斜杠） | 不替换 | 目录层级在目标路径中被**保留** |
+| `\`（反斜杠） | 替换为 `_` | 反斜杠目录层级丢失，变成单个文件名的一部分 |
+| `: * ? " < > \|` | 替换为 `_` | Windows 非法字符被清除 |
+
+**`JoinRaw` 会按 `/` 分割并重建路径**（[uri.go:173-175](pkg/filemanager/fs/uri.go#L173-L175)）：
+
+```go
+func (u *URI) JoinRaw(elem string) *URI {
+    return u.Join(strings.Split(strings.TrimPrefix(elem, Separator), Separator)...)
+}
+func (u *URI) Join(elem ...string) *URI {
+    return &URI{U: u.U.JoinPath(lo.Map(elem, func(s string, i int) string {
+        return PathEscape(s)  //  每个路径片段做 URL 编码
+    })...)}
+}
+```
+
+示例（主机 `masterTransfer`）：
+
+```go
+sanitizedName := sanitizeFileName(file.Name)      // file.Name = "subdir/My:File.txt"
+                                                  // sanitizedName = "subdir/My_File.txt" （:  _，/ 保留）
+dst := dstUri.JoinRaw(sanitizedName)               // dstUri = "cr:///我的下载"
+// JoinRaw 过程：
+//   strings.Split("subdir/My_File.txt", "/")  ["subdir", "My_File.txt"]
+//   Join(...)  对每段 PathEscape 后拼接
+//   结果："cr:///我的下载/subdir/My_File.txt"
+```
+
+##### sanitizeFileName 在代码中的 4 处调用
+
+| 调用位置 | 用途 | 目录层级是否保留 |
+|---------|------|-----------------|
+| [remote_download.go:356](pkg/filemanager/workflows/remote_download.go#L356) | slaveTransfer 目标路径 | 是（`/` 保留） |
+| [remote_download.go:469](pkg/filemanager/workflows/remote_download.go#L469) | masterTransfer 目标路径 | 是（`/` 保留） |
+| [remote_download.go:582](pkg/filemanager/workflows/remote_download.go#L582) | PreValidateUpload 校验 | 是（`/` 保留，但 PreValidateUpload 内部用 `path.Base` 只取最后文件名做策略校验） |
+| 源文件定位链（`path.Join(SavePath, file.Name)`） | 打开本地文件 | 不调用 sanitize，完整保留 |
+
+**源路径和目标路径的目录层级对照**：
+
+```
+file.Name = "subdir/My:File.txt"
+         
+          源路径（不 sanitize）：SavePath + "/subdir/My:File.txt"
+                                         磁盘上实际存在的文件路径
+         
+          目标路径（sanitize + JoinRaw）：DstUri + "/subdir/My_File.txt"
+                                                Cloudreve 中的落库路径
+```
+
+**注意**：如果 `file.Name` 中含有反斜杠 `\`（例如下载器在 Windows 上返回了含反斜杠的路径），sanitize 会把 `\` 替换为 `_`，导致**目标路径的目录层级扁平化**，但源路径的目录层级仍被保留（源路径不走 sanitize）。此时源和目标的目录结构可能不一致。
 
 ### 11.2 Cleanup 中的路径
 
@@ -729,26 +833,15 @@ Aria2 的 `Cancel()` 在 [aria2.go:206-212](pkg/downloader/aria2/aria2.go#L206-L
 
 ### 11.3 运行时路径的潜在风险
 
-1. **qBittorrent file.Name 不是相对路径**：qBittorrent 返回的 `file.Name` 是 `filepath.ToSlash(item.Name)`，通常包含种子名称前缀（如 `ubuntu-22.04/file.txt`）。当 `masterTransfer` 拼接 `path.Join(SavePath, file.Name)` 时，路径变为 `savepath/ubuntu-22.04/file.txt`。而 qBittorrent 实际保存的文件路径是 `SavePath/ubuntu-22.04/file.txt`，与拼接结果一致，**不会出问题**。但如果 qBittorrent 返回的 `Name` 字段与实际目录结构不完全匹配，就会出现 `os.Open` 找不到文件的错误。
+1. **反斜杠导致源/目标目录层级不一致**：如果 `file.Name` 中含反斜杠 `\`，源路径（不 sanitize）会按反斜杠保留目录层级，但目标路径（sanitize 把 `\` 转 `_`）会丢失层级，变成扁平文件名。导致源文件在嵌套目录里，目标文件在单层目录下。
 
-2. **跨 OS 主从部署**：如果主机是 Linux、从机是 Windows（或反过来），`SavePath` 的正斜杠中间表示是正确的——因为 `filepath.FromSlash` 会在实际使用端按本地 OS 转换。但如果 Aria2/qBittorrent 运行在从机上，而 `SavePath` 中的根路径（如 `/tmp/`）在 Windows 上无意义，则 `os.Open` 会失败。**这不是代码 bug，而是部署约束**——从机下载器的临时路径必须是本机有效路径。
+2. **跨 OS 主从部署**：如果主机是 Linux、从机是 Windows（或反过来），`SavePath` 的正斜杠中间表示是正确的因为 `filepath.FromSlash` 会在实际使用端按本地 OS 转换。但如果下载器运行在从机上，而 `SavePath` 中的根路径（如 `/tmp/`）在 Windows 上无意义，则 `os.Open` 会失败。**这不是代码 bug，而是部署约束**从机下载器的临时路径必须是本机有效路径。
 
 3. **Windows 长路径**：临时路径经过 `filepath.Join(base, "aria2", uuid)` 三层嵌套，再加上种子内部目录结构，可能超过 Windows 260 字符限制。Go 默认使用长路径前缀（`\\?\`）可缓解，但 Aria2/qBittorrent 自身不一定支持。
 
-### 11.4 目标路径的 sanitize
+4. **PreValidateUpload 只校验最后文件名**：`PreValidateUpload` 内部用 `path.Base(file.Name)`（[dbfs/upload.go:58](pkg/filemanager/fs/dbfs/upload.go#L58)）只取最后一段文件名做存储策略校验，不校验中间目录名。如果 `file.Name` = `subdir/My:File.txt`，只校验 `My_File.txt` 的合法性，`subdir` 目录名是否合法不被校验。
 
-目标文件名（非源文件路径）通过 [sanitizeFileName()](pkg/filemanager/workflows/remote_download.go#L681-L684) 处理：
-
-```go
-func sanitizeFileName(name string) string {
-    r := strings.NewReplacer("\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
-    return r.Replace(name)
-}
-```
-
-将 Windows 不允许的字符替换为下划线。源文件路径 `src` 不做 sanitize——因为它是下载器生成的本地路径，被假定为文件系统上合法且存在的路径。
-
-### 11.5 Summarize 中的路径脱敏
+### 11.4 Summarize 中的路径脱敏
 
 [Summarize()](pkg/filemanager/workflows/remote_download.go#L629-L661) 中将 `SavePath` 置空后返回给前端：
 
