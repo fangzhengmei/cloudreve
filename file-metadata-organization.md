@@ -226,6 +226,32 @@ if o.loadFilePublicMetadata {
 }
 ```
 
+#### 2.3.2 文件系统列表入口 vs 分享列表入口的元数据加载差异
+
+系统存在两条独立的"列表"入口，元数据加载策略完全不同：
+
+| 维度 | 文件系统列表（manager.List） | 分享列表（shareClient.List） |
+|------|---------------------------|---------------------------|
+| **调用入口** | `service/explorer/file.go` 的 `ListFileService.List` | `service/share/visit.go` 的 `ListShareService.List` / `ListInUserProfile` |
+| **查询对象** | `ent.File`（文件记录） | `ent.Share`（分享记录），再通过 Edge 加载关联的 File |
+| **元数据 Context Key** | `LoadFilePublicMetadata`（由 DBFS 层设置） | `LoadFileMetadata`（由 Service 层直接设置） |
+| **元数据范围** | 仅公开元数据（`is_public=true`） | **全部元数据**（含私有，无 `is_public` 过滤） |
+| **使用场景** | 文件浏览器（explorer）的所有文件列表 | 分享管理页面（查看我发出的分享）、用户资料页的公开分享 |
+
+**分享列表入口的完整设置**（[visit.go#L142-L144](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/service/share/visit.go#L142-L144)）：
+
+```go
+ctx := context.WithValue(c, inventory.LoadShareUser{}, true)
+ctx = context.WithValue(ctx, inventory.LoadShareFile{}, true)
+ctx = context.WithValue(ctx, inventory.LoadFileMetadata{}, true)  // ← 全部元数据！
+res, err := shareClient.List(ctx, args)
+```
+
+**关键差异原因**：
+- 文件系统列表面向可能非 owner 的访问者，仅能看到公开元数据
+- 分享列表由分享发起者（owner）查看自己的分享记录，需要完整的文件信息（包括 `sys:fulltext_index` 等系统元数据）
+- 两条入口走完全独立的查询路径：`manager.List` → `DBFS.List` → `inventory.GetChildFiles` vs `shareClient.List` → `ent.Share.Query` → `WithFile()` → `WithMetadata()`
+
 **我的文件（myNavigator）**：
 - 列表查询：默认通过 `manager.List` 加载公开元数据
 - 单个文件查询：根据调用方是否传入 `WithFilePublicMetadata()` 决定（如 [file.go#L642](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/service/explorer/file.go#L642)）
@@ -251,7 +277,7 @@ if o.loadFilePublicMetadata {
 - 元数据仅加载公开元数据（因为调用方仅传入 `WithFilePublicMetadata`）
 - 路径以 `sharedWithMe` 文件系统前缀 + hashid 文件ID 构成
 
-#### 2.3.2 列表过滤中的元数据过滤
+#### 2.3.3 列表过滤中的元数据过滤
 
 搜索过滤时，元数据条件**仅匹配公开元数据**（[file_utils.go#L75-L88](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/inventory/file_utils.go#L75-L88)）：
 
@@ -272,7 +298,7 @@ q = q.Where(
 - 非 owner 用户无法通过搜索来探测他人的私有元数据
 - 元数据搜索条件与元数据预加载的可见范围一致
 
-#### 2.3.3 运行时读取与延迟加载
+#### 2.3.4 运行时读取与延迟加载
 
 **运行时读取**（[file.go#L165-L172](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/file.go#L165-L172)）：
 
@@ -486,6 +512,59 @@ SetIsPublic(!isPrivate)  // isPrivate=false → !false=true → is_public=true
 
 这就是为什么回收站列表不需要 `LoadFileMetadata`（加载全部元数据），仅通过 `LoadFilePublicMetadata` 就能正确显示原始文件名。
 
+**restore_uri 虽是公开元数据但仅当前用户可见的边界原因**：
+
+`is_public=true` 只是元数据层面的可见性标记，真正保证数据隔离的是 **SQL 查询的 WHERE 条件** 和 **文件系统导航器选择** 这两层边界：
+
+**边界 1：owner_id 过滤（SQL 层）**
+
+`trashNavigator.Children` 调用 `baseNavigator.children(ctx, nil, args)`，最终执行：
+
+```go
+// childFileQuery 中 root == nil 且 isSymbolic = false 时
+predicates = append(predicates,
+    file.NameNEQ(RootFolderName),
+    file.OwnerIDEQ(ownerID),       // ← owner_id == 当前用户 ID
+    file.Not(file.HasParent()),    // ← 无父级（已被 SoftDelete 清除）
+)
+```
+
+`file.OwnerIDEQ(ownerID)` 确保 SQL 查询只返回 `owner_id = 当前用户ID` 的文件记录。即使用户 B 也有一条 `is_public=true` 的 `sys:restore_uri` 元数据，由于其 `file.owner_id != 用户A.ID`，用户 A 根本查不到那条 File 记录，自然不可能读取到其元数据。
+
+**边界 2：回收站导航器的隔离（URI 层）**
+
+只有 URI 的文件系统类型为 `FileSystemTrash` 时，`getNavigator` 才会选择 `trashNavigator`：
+
+```go
+case constants.FileSystemTrash:
+    n = NewTrashNavigator(f.user, f.fileClient, f.l, config, f.hasher)
+```
+
+而回收站 URI 由当前用户请求时通过 `newTrashUri(name)` 生成，格式为 `cloudreve://trash/{name}`，不包含其他用户的信息。其他用户不可能构造出指向你回收站的合法 URI。
+
+**边界 3：软删除时清除父级关联（文件关系层）**
+
+`SoftDelete` 执行时（[manage.go#L296-L306](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/manage.go#L296-L306)）：
+
+```go
+fc.SoftDelete(ctx, target.Model)
+// SoftDelete 内部：
+newName := uuid.Must(uuid.NewV4())
+UpdateOne(file).SetName(newName.String()).ClearParent().Save(ctx)
+```
+
+`ClearParent()` 将 `file_children` 置为 NULL，文件从原目录树中彻底脱离，变成"孤儿"。其他用户即使通过原路径也无法再访问到该文件。
+
+**总结三层边界**：
+
+| 边界层级 | 机制 | 作用 |
+|---------|------|------|
+| SQL 查询层 | `file.OwnerIDEQ(ownerID)` + `file.Not(file.HasParent())` | 只返回当前用户的无父级文件 |
+| URI 路由层 | `FileSystemTrash` → `trashNavigator`，URI 由当前用户生成 | 其他用户无法访问你的回收站 URI |
+| 文件关系层 | `ClearParent()` 清除 `file_children` | 文件从原目录树脱离，无法通过路径访问 |
+
+`is_public=true` 只是"当文件被成功查询到时，这条元数据是否被附带加载"的标记，**不参与访问控制判断**。真正的访问控制在 SQL 的 WHERE 条件和文件系统导航层就已经完成了。这是一个典型的"先过滤行，再选择列"的安全模型。
+
 #### 3.6.3 他人分享给我（sharedWithMeNavigator）
 
 **根目录的双重身份**：
@@ -501,41 +580,98 @@ SetIsPublic(!isPrivate)  // isPrivate=false → !false=true → is_public=true
 
 ```go
 if t.root == nil {
-    // 1. 实际对象：查询当前用户自己的根文件夹
-    rootFile, err := t.fileClient.Root(ctx, t.user)  // ← 实际的 File 记录
-    
-    t.root = newFile(nil, rootFile)  // ← 用真实 File 记录创建内存节点
-    // 2. 虚拟路径：覆盖为 sharedWithMe 前缀
-    rootPath := newSharedWithMeUri("")  // ← 虚拟路径 cloudreve://sharedWithMe
+    rootFile, err := t.fileClient.Root(ctx, t.user)
+    t.root = newFile(nil, rootFile)
+    rootPath := newSharedWithMeUri("")
     t.root.Path[pathIndexRoot], t.root.Path[pathIndexUser] = rootPath, rootPath
     t.root.OwnerModel = t.user
-    t.root.IsUserRoot = true  // ← 标记为用户根
+    t.root.IsUserRoot = true
 }
 ```
 
 **关键：虚拟根不代表真实的目录关系**
-- `sharedWithMeNavigator` 的根目录在数据库中是用户自己的根文件夹（`t.fileClient.Root`）
-- 但 `To()` 方法限制 `len(elements) > 0` 直接报错，意味着无法像普通目录那样向下遍历
-- `Children()` 传入 `parent = nil`（不是 `t.root`），查询所有共享给该用户的文件（不是查询 t.root 的子级）
+- `sharedWithMeNavigator` 的根目录在数据库中是用户自己的根文件夹
+- 但 `To()` 方法限制 `len(elements) > 0` 直接报错，无法像普通目录那样向下遍历
+- `Children()` 传入 `parent = nil`（不是 `t.root`），不基于虚拟根查询子级
 - 因此虚拟根只是一个"容器"，不参与真实的目录关系
 
-**列表查询过滤**：
-- 设置 `args.SharedWithMe = true`（[sharewithme_navigator.go#L89](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L89)），由 inventory 层添加共享过滤条件
-- 仅返回 `share.sharee` 包含当前用户的文件（即他人共享给我的文件）
+**列表查询过滤：inventory 层的 SharedWithMe 查询**
 
-**虚拟路径重写**：
+`sharedWithMeNavigator.Children` 设置 `args.SharedWithMe = true` 后，`baseNavigator.children` 调用：
 
-每个结果文件的用户视角路径被重写（[sharewithme_navigator.go#L96-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L96-L98)）：
+```go
+b.fileClient.GetChildFiles(ctx, &inventory.ListFileParameters{
+    PaginationArgs: args.Page,
+    SharedWithMe:   args.SharedWithMe,  // true
+}, b.user.ID, model)  // model = nil（parent = nil）
+```
+
+进入 `childFileQuery` 后（[file_utils.go#L118-L155](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/inventory/file_utils.go#L118-L155)），因 `root[0] == nil` 走孤儿查询分支，且 `isSymbolic = SharedWithMe = true`：
+
+```go
+predicates = append(predicates,
+    file.NameNEQ(RootFolderName),
+    file.OwnerIDEQ(ownerID),                 // ← 只查当前用户自己拥有的文件
+    file.And(file.IsSymbolic(true),          // ← 且是 symbolic 链接
+              file.FileChildrenNotNil()),    // ← 有父级（不是孤儿）
+)
+```
+
+他人共享给"我"的文件，是以 **symbolic link 文件夹** 的形式存在于"我"的文件系统中的，有 `file_children`（父级指向某个逻辑位置），但 `owner_id` 是"我"，`is_symbolic=true`。实际文件内容通过 `sys:shared_redirect` 元数据指向原文件。
+
+**列表结果是游离节点（Orphan Nodes）的原因**：
+
+`baseNavigator.children` 中（[navigator.go#L260-L264](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/navigator.go#L260-L264)）：
+
+```go
+Files: lo.FilterMap(children.Files, func(model *ent.File, index int) (*File, bool) {
+    f := newFile(parent, model)   // ← parent = nil！
+    return b.listFilter(ctx, f)
+}),
+```
+
+因 `parent = nil`，在 `newFile` 中（[file.go#L329-L353](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/file.go#L329-L353)）走 `else` 分支：
+
+```go
+if parent != nil {
+    f.Parent = parent
+    parent.Children[model.Name] = f          // 加入父节点 Children map
+    f.Path[pathIndexUser] = parent.Path[pathIndexUser].Join(model.Name)   // 继承用户视角路径
+    f.Path[pathIndexRoot] = parent.Path[pathIndexRoot].Join(model.Name)   // 继承 owner 视角路径
+} else {
+    f.mu = &sync.Mutex{}
+    // Parent 为 nil
+    // Children map 中无记录
+    // Path[0] 和 Path[1] 都为 nil！
+}
+```
+
+**游离节点的三个特征**：
+1. `f.Parent = nil` — 不挂到任何父节点
+2. 不在任何 `parent.Children` map 中 — 无法通过父节点按名称查找
+3. `f.Path[pathIndexRoot]` 和 `f.Path[pathIndexUser]` 均为 nil — 无自动生成的路径缓存
+
+之后 `sharedWithMeNavigator.Children` 才**手动覆盖**用户视角路径（[sharewithme_navigator.go#L96-L98](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/sharewithme_navigator.go#L96-L98)）：
 
 ```go
 res.Files[i].Path[pathIndexUser] = newSharedWithMeUri(hashid.EncodeFileID(t.hasher, res.Files[i].Model.ID))
 ```
 
-**虚拟路径格式**：`cloudreve://sharedWithMe/{hashid_fileID}`
+但 `Path[pathIndexRoot]` 永远保持 nil。
 
-- 使用 hashid 编码的文件 ID 作为路径，不暴露真实目录结构
-- 每个共享文件有独立的虚拟路径，相互之间没有层级关系
-- 这是一个"扁平列表"，不是树形目录
+**Owner 视角路径缓存为什么不再代表通用规则**：
+
+`Path[pathIndexRoot]`（owner 视角路径）在标准导航场景下通过 `newFile` 自动从父级继承，但在以下场景中失效：
+
+| 场景 | Path[pathIndexRoot] 状态 | 原因 |
+|------|------------------------|------|
+| 标准 my 目录浏览 | 正常：`cloudreve://my/folder1/file.txt` | `parent != nil` 且 `parent.Path[pathIndexRoot] != nil`，自动继承 |
+| sharedWithMe 列表 | **nil** | `parent = nil`，`newFile` 不设置；且虚拟根的 pathIndexRoot 也被覆盖为 sharedWithMe 前缀，不是真实 owner 根 |
+| 回收站列表 | **nil** | `parent = nil`，`newFile` 不设置；回收站文件无真实目录层级 |
+| 递归搜索展开的文件夹 | 正常：由 `f.Path[pathIndexUser] = p.Uri(false).Join(model.Name)` 手动设置 | 递归搜索中单独处理，与 `newFile` 自动继承逻辑不同 |
+| 回收站恢复时的目标定位 | 正常：通过 `MetadataRestoreUri` 恢复 | 从元数据中取回原始 owner 视角 URI |
+
+**核心结论**：`Path[pathIndexRoot]` 仅在"标准 my 文件系统的正常层级导航"场景下可靠。在 sharedWithMe、回收站、递归搜索等场景中，它可能为 nil 或被覆盖为虚拟前缀，**不能作为通用规则来推导文件的真实 owner 路径**。如需 owner 视角路径，应优先使用 `f.Uri(true)`，该方法会向上遍历直到找到有 `Path[index]` 的祖先。
 
 **URI 与导航器的映射**（[dbfs.go#L738-L739](file:///d:/fz/0601-1/solo-dogfeeding/code/49-Cloudreve/pkg/filemanager/fs/dbfs/dbfs.go#L738-L739)）：
 
