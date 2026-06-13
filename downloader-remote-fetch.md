@@ -412,3 +412,284 @@ type Task struct {
     UserTasks     int              // 所属用户 ID
 }
 ```
+
+## 9. 进度查询机制
+
+前端获取远程下载任务状态与进度有两条 API 路径：
+
+### 9.1 API 入口
+
+| API | 路径 | 用途 |
+|-----|------|------|
+| 任务列表 | `GET /api/v4/workflow?category=downloading|downloaded` | 查询任务列表与 Summary |
+| 任务进度 | `GET /api/v4/workflow/progress/:id` | 查询单个任务的实时 Progress |
+
+路由注册见 [router.go:554-561](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/routers/router.go#L554-L561)。
+
+### 9.2 任务列表与 Summary
+
+`ListTasks()` 定义于 [workflows.go:324-384](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L324-L384)，按 `category` 分类查询：
+
+- **downloading**：查询状态为 `StatusSuspending / StatusProcessing / StatusQueued` 的远程下载任务，`PageSize` 强制设为 `intsets.MaxInt`（即一次性返回所有进行中任务）
+- **downloaded**：查询状态为 `StatusCanceled / StatusError / StatusCompleted` 的远程下载任务
+
+每个任务通过 `task.Summarize(hasher)` 生成摘要，返回到前端的 `TaskResponse` 结构体（[response.go:88-101](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/response.go#L88-L101)）：
+
+```go
+type TaskResponse struct {
+    CreatedAt    time.Time      `json:"created_at,"`
+    UpdatedAt    time.Time      `json:"updated_at"`
+    ID           string         `json:"id"`          // HashID 编码
+    Status       string         `json:"status"`      // DB 任务状态
+    Type         string         `json:"type"`        // "remote_download"
+    Node         *user.Node     `json:"node,omitempty"`
+    Summary      *queue.Summary `json:"summary,omitempty"` // 核心：包含 Phase 和下载器状态
+    Error        string         `json:"error,omitempty"`
+    ErrorHistory []string       `json:"error_history,omitempty"`
+    Duration     int64          `json:"duration,omitempty"`
+    ResumeTime   int64          `json:"resume_time,omitempty"`
+    RetryCount   int            `json:"retry_count,omitempty"`
+}
+```
+
+### 9.3 Summarize 返回内容
+
+[RemoteDownloadTask.Summarize()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L629-L661) 返回的 Summary 结构：
+
+```go
+&queue.Summary{
+    Phase:  string(m.state.Phase),    // "" | "monitor" | "transfer" | "seeding"
+    NodeID: m.state.NodeID,
+    Props: map[string]any{
+        "src_str":    m.state.SrcUri,           // 下载 URL
+        "src":        m.state.SrcFileUri,        // 种子文件 URI
+        "dst":        m.state.Dst,               // 目标路径
+        "failed":     failed,                    // 失败文件数
+        "download":   status,                    // downloader.TaskStatus 快照（SavePath 已脱敏为空）
+    },
+}
+```
+
+**状态显示的关键问题**：前端拿到的 DB 状态 `Status` 字段只能是 `queued / processing / suspending / error / canceled / completed` 之一，而真正的下载进度信息在 `Summary.Props["download"]` 中。对用户来说：
+
+| 用户感知 | DB Status | Phase | Summary.download.state |
+|---------|-----------|-------|----------------------|
+| 等待中 | queued | "" | 无 |
+| 下载中 | suspending | monitor | downloading |
+| 做种中 | suspending | monitor / seeding | seeding |
+| 传输中 | processing | transfer | completed/seeding |
+| 等待做种结束 | suspending | seeding | seeding |
+| 已完成 | completed | seeding | completed |
+| 失败 | error | 任意 | error/unknown |
+| 已取消 | canceled | 任意 | 无 |
+
+**问题：DB 状态与用户感知的映射不直观**。`suspending` 在不同 Phase 下含义完全不同，需要前端结合 `Phase` + `download.state` 才能正确展示。若前端仅依赖 `status` 字段，会出现"下载中"和"传输中"都显示为 `suspending/processing` 的困惑。
+
+### 9.4 实时进度查询
+
+[TaskPhaseProgress()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L386-L396) 从内存中的 `TaskRegistry` 获取运行中任务的 `Progress()`：
+
+```go
+func TaskPhaseProgress(c *gin.Context, taskID int) (queue.Progresses, error) {
+    r := dep.TaskRegistry()
+    t, found := r.Get(taskID)       // 仅内存中的活跃任务
+    if !found || (权限校验) {
+        return queue.Progresses{}, nil
+    }
+    return t.Progress(c), nil
+}
+```
+
+[RemoteDownloadTask.Progress()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L663-L679) 合并两个来源的进度：
+
+```go
+func (m *RemoteDownloadTask) Progress(ctx) queue.Progresses {
+    merged := make(queue.Progresses)
+    // 1. masterTransfer 的上传进度（仅主机节点有值）
+    for k, v := range m.progress {
+        merged[k] = v
+    }
+    // 2. slaveTransfer 的从机上传进度（仅从机节点有值）
+    if m.state.NodeState.progress != nil {
+        for k, v := range m.state.NodeState.progress {
+            merged[k] = v
+        }
+    }
+    return merged
+}
+```
+
+进度 key 的含义（定义于 [archive.go:69-72](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/archive.go#L69-L72) 和 [remote_download.go:71-72](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L71-L72)）：
+
+| key | 含义 | Total | Current |
+|-----|------|-------|---------|
+| `upload` | 传输总字节数 | 选中文件总大小 | 已传输字节数 |
+| `upload_count` | 传输文件计数 | 选中文件数 | 已传输文件数 |
+| `upload_single_{n}` | 单文件传输 | 单文件大小 | 已传输字节，Identifier 为目标 URI |
+| `relocate` | 重定位计数 | 重定位文件数 | 已完成数 |
+
+**重要限制**：`Progress()` 仅在任务存在于内存 `TaskRegistry` 时可用。任务一旦到达终态（completed/error/canceled），会从 Registry 中 `Delete()`，此时 `Progress()` 返回空 map。
+
+### 9.5 下载阶段的进度
+
+在 `Phase=monitor`（下载中）阶段，`Progress()` 返回空 map，因为下载进度的信息不在 `m.progress` 中，而是存在于 `Summary.Props["download"]` 中：
+
+```json
+{
+  "download": {
+    "state": "downloading",
+    "total": 1073741824,
+    "downloaded": 536870912,
+    "download_speed": 1048576,
+    "name": "ubuntu-22.04.iso",
+    "files": [...]
+  }
+}
+```
+
+前端需要从 `Summary.download.downloaded / total` 计算下载百分比，而非从 `Progress()` API 获取。
+
+## 10. 重复提交规则分析
+
+### 10.1 创建入口无 URL 级去重
+
+[CreateDownloadTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L81-L169) 的逻辑：
+
+```go
+// 批量创建——遍历 Src 列表，每个 URL 创建一个独立任务
+for _, src := range service.Src {
+    t, _ := workflows.NewRemoteDownloadTask(c, src, service.SrcFile, service.Dst)
+    dep.RemoteDownloadQueue(c).QueueTask(c, t)
+    tasks = append(tasks, t)
+}
+```
+
+**没有任何去重校验**。每次调用都会创建一个全新的 `RemoteDownloadTask`，即使 URL 完全相同。系统不检查：
+- 同一用户是否已有相同 URL 的进行中任务
+- 同一 URL 是否已被其他用户下载
+- 相同 Dst 下是否已有同名文件
+
+### 10.2 批量数量限制
+
+唯一的限流手段是 `Aria2BatchSize`（[workflows.go:114-117](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/service/explorer/workflows.go#L114-L117)）：
+
+```go
+limit := user.Edges.Group.Settings.Aria2BatchSize
+if limit > 0 && len(service.Src) > limit {
+    return nil, serializer.NewError(serializer.CodeBatchAria2Size, "", nil)
+}
+```
+
+这只是限制单次请求的批量大小，不是去重。
+
+### 10.3 队列级也无去重
+
+[QueueTask()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/queue.go#L184-L209) 只做以下操作：
+1. 状态转 `StatusQueued`
+2. 持久化到 DB
+3. 推入 FIFO 调度器
+4. 注册到 TaskRegistry（`registry.Set(t.ID(), t)`）
+
+FIFO 调度器（[scheduler.go](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/queue/scheduler.go)）按 `ResumeTime` 最小堆排序，无去重逻辑。TaskRegistry 是 `map[int]Task`，按 DB 自增 ID 索引，也不会检测重复。
+
+### 10.4 下载器级可能的隐式去重
+
+Aria2 本身可能对相同 URL 的重复添加产生不同 GID（不同任务），因此**不会在下载器层面自动去重**。但如果 URL 指向同一资源，两个 Cloudreve 任务会各自监控独立的 Aria2 GID，最终各自传输文件到 Dst，**导致 Dst 下出现文件覆盖或版本冲突**。
+
+### 10.5 文件级冲突处理
+
+当两个任务同时完成下载并传输到同一 Dst 时，`fm.Update()` → `PrepareUpload()` 会在 DBFS 中处理：
+- 如果目标文件已存在，会创建新版本（Entity Type = Version）
+- 不会因为文件已存在而拒绝上传
+
+### 10.6 重启恢复时的重复风险
+
+[GetPendingTasks()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/inventory/task.go#L165-L187) 查询所有 `StatusIn(processing, queued, suspending)` 的任务并重新入队。如果重启前有重复 URL 的任务，重启后都会恢复执行，不存在去重。
+
+**总结**：当前系统**不提供任何 URL 级去重机制**，同一 URL 可以被重复提交，产生独立的下载任务并最终在目标路径创建文件版本。
+
+## 11. 本机路径问题分析
+
+### 11.1 masterTransfer 的路径拼接
+
+[remote_download.go:471](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L471) 的关键路径构建：
+
+```go
+src := filepath.FromSlash(path.Join(m.state.Status.SavePath, file.Name))
+```
+
+这里混合使用了两个包：
+- `path.Join`：POSIX 风格路径拼接（正斜杠）
+- `filepath.FromSlash`：将正斜杠转为操作系统路径分隔符
+
+`SavePath` 来自 Aria2 的 `status.Dir` 字段，在 [aria2.go:130](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L130) 中被转为正斜杠：
+
+```go
+savePath := filepath.ToSlash(status.Dir)
+```
+
+因此 `path.Join(SavePath, file.Name)` 总是先拼接出 POSIX 路径，再由 `filepath.FromSlash` 转为系统路径。在 Windows 上最终是反斜杠路径。
+
+### 11.2 SavePath 的生成
+
+Aria2 任务的临时保存路径由 [aria2.go:277-291](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L277-L291) 生成：
+
+```go
+func (a *aria2Client) tempPath(ctx) string {
+    guid, _ := uuid.NewV4()
+    base := util.RelativePath(a.options.TempPath)
+    if a.options.TempPath == "" {
+        base = util.DataPath(a.settings.TempPath(ctx))
+    }
+    path := filepath.Join(base, Aria2TempFolder, guid.String())
+    return path
+}
+```
+
+每次创建下载任务时生成唯一的临时目录，传入 Aria2 作为 `dir` 选项。
+
+### 11.3 file.Name 的来源
+
+`file.Name` 来自 Aria2 RPC 返回的文件信息，在 [aria2.go:148-149](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/downloader/aria2/aria2.go#L148-L149) 中被处理为相对路径：
+
+```go
+relPath := strings.TrimPrefix(filepath.ToSlash(item.Path), savePath)
+if len(relPath) > 0 {
+    relPath = relPath[1:]  // 去掉前导 "/"
+}
+```
+
+即 `file.Name` 是相对于 `SavePath` 的相对路径。对于 BT 多文件下载，可能是 `子目录/文件名` 的形式。
+
+### 11.4 路径问题的具体风险
+
+1. **Windows 路径分隔符问题**：`SavePath` 经 `filepath.ToSlash` 转为正斜杠，但 Aria2 在 Windows 上实际使用的 `Dir` 是反斜杠路径。如果 Aria2 配置的 `TempPath` 包含反斜杠，`filepath.ToSlash` 后再 `path.Join` 可能产生混合分隔符的路径。
+
+2. **BT 多文件目录结构**：当 BT 种子包含子目录时，`file.Name` 为 `子目录/文件名`。`path.Join(SavePath, file.Name)` 拼接后 `os.Open(src)` 要求文件系统上实际存在该嵌套路径。
+
+3. **从机路径差异**：[slaveTransfer](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L357) 中使用 `path.Join`（不加 `filepath.FromSlash`）：
+
+   ```go
+   src := path.Join(m.state.Status.SavePath, f.Name)
+   ```
+
+   从机路径直接传给从机的 `SlaveUploadTask`，由从机自己打开文件。这里**没有做 `filepath.FromSlash` 转换**，但 `SlaveUploadTask.Do()` 中打开文件使用的是 `filepath.FromSlash(file.Src)`（[upload.go:134](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/upload.go#L134)）：
+
+   ```go
+   handle, err := os.Open(filepath.FromSlash(file.Src))
+   ```
+
+   所以从机路径实际上是在打开时才做转换，与主机的处理时机不同但效果一致。
+
+4. **Cleanup 的路径安全**：[Cleanup()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L602) 使用 `os.RemoveAll(m.state.Status.SavePath)` 删除临时目录。`SavePath` 来自下载器状态，如果下载器返回的路径被篡改或异常，可能产生误删风险。但 `SavePath` 仅在主机节点且非空时才执行删除，且路径由系统生成（UUID 目录），风险较低。
+
+5. **目标路径 sanitize**：目标文件名通过 [sanitizeFileName()](file:///d:/fz/0601-1/solo-dogfeeding/code/46-Cloudreve/pkg/filemanager/workflows/remote_download.go#L681-L684) 处理：
+
+   ```go
+   func sanitizeFileName(name string) string {
+       r := strings.NewReplacer("\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+       return r.Replace(name)
+   }
+   ```
+
+   将 Windows 不允许的字符替换为下划线。但源文件路径 `src` 不做 sanitize——因为它由下载器生成，被假定为合法的文件系统路径。
