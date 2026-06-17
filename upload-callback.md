@@ -16,8 +16,10 @@
 
 **关联标识：**
 - `UploadSessionID`：UUID v4，用于 KV 键值查找会话
-- `CallbackSecret`：32位加密随机字符串，作为回调 URL 的路径参数，充当第一层鉴权
+- `CallbackSecret`：32位加密随机字符串，仅作为回调 URL 的路径参数之一，**提供路径不可枚举性（被动防御），不参与显式校验**
 - KV 缓存 Key：`callback_{sessionID}`
+
+> ⚠️ **重要澄清**：CallbackSecret 虽然存在于回调 URL 路径中，但服务端回调处理链中**从未读取 URL 中的 `:key` 参数，也从未与 KV 中存储的 `CallbackSecret` 做对比校验**。它的安全性完全依赖"无法枚举32位随机字符串"。详见下方"第五章"的详细证据链。
 
 ---
 
@@ -228,10 +230,10 @@ POST|GET /api/v4/callback/{driverType}/{sessionID}/{callbackSecret}
 
 **实现位置：** [auth.go:178-217](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go#L178-L217)
 
-核心校验：
+核心校验（对照源码逐行分析）：
 
 ```go
-// 1. sessionID 非空检查
+// 1. sessionID 非空检查（从 URL Path 读 :sessionID）
 sessionID := c.Param("sessionID")
 if sessionID == "" { return CodeParamErr }
 
@@ -247,7 +249,14 @@ if callbackSession.Policy.Type != string(policyType) { return CodePolicyNotAllow
 SetUserCtx(c, callbackSession.UID)
 ```
 
-> **注意：** CallbackSecret 作为 URL Path 的一部分传入，但在 UseUploadSession 中并未直接校验。它的安全性依赖于：① KV中只有通过 sessionID 才能找到会话；② secret 是32位密码学随机数，无法枚举。
+> ⚠️ **关键代码对照：** 路由定义中 URL 格式是 `{driverType}/{sessionID}/{key}`（见 [router.go:476-545](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/routers/router.go#L476-L545)），第三个路径参数命名为 `:key` 即 CallbackSecret。但在整个 `uploadCallbackCheck` 函数中：
+> - **完全没有** `c.Param("key")`
+> - **完全没有** 从 `c.Param("key")` 读取 URL 中的 CallbackSecret
+> - **完全没有** 与会话中存储的 `callbackSession.CallbackSecret` 做任何形式的对比校验
+>
+> 在后续所有中间件（OSSCallbackAuth / RemoteCallbackAuth / QiniuCallbackValidate / UpyunCallbackAuth）中，也没有任何一处代码读取或校验 URL 中的 `:key`。
+>
+> 代码证据：全局搜索 `c.Param(["']key["'])` 在 `middleware/` 目录下 **0 条匹配**；全局搜索 CallbackSecret 只出现在"生成 CallbackSecret"、"嵌入回调URL"和"返回给客户端"三类位置，**从未出现在"读取URL参数并比较"的代码位置**。
 
 ### 4.4 第二层：各驱动签名核验
 
@@ -388,9 +397,140 @@ if uploadSession.Props.Size != callbackBody.Size {
 
 ---
 
-## 五、异常分支处理全景
+## 五、SessionID / CallbackSecret / 驱动签名层的分工与校验机制
 
-### 5.1 凭证签发阶段失败
+本章是核心澄清章节，以"代码证据"形式逐要素解答：**回调密钥是否真的参与了校验？三者在整体安全体系中各自的角色是什么？**
+
+### 5.1 CallbackSecret 完整生命周期追踪（代码证据链）
+
+CallbackSecret 在系统中经历了 **生成 → 存储 → 嵌入URL → 客户端接收 → 存储商回调时带回** 共五个阶段：
+
+| 阶段 | 代码位置 | 核心操作 | 是否"读取URL中的Secret并比较"？ |
+|------|---------|---------|-------------------------------|
+| **①生成** | [dbfs/upload.go:250](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L250) | `CallbackSecret: util.RandStringRunesCrypto(32)` | —（生成阶段） |
+| **②存储到会话** | 同上行 | 存入 `UploadSession.CallbackSecret` 字段 | —（存储阶段） |
+| **③嵌入回调URL** | [routes.go:46-49](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/cluster/routes/routes.go#L46-L49) | `MasterSlaveCallbackUrl(base, driver, id, secret)` → URL 路径为 `{driver}/{id}/{secret}` | —（构造URL阶段） |
+| **④返回给客户端** | [manager/upload.go:113](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L113) | `credential.CallbackSecret = uploadSession.CallbackSecret` | —（传递给客户端阶段） |
+| **⑤存储商回调带回到服务端** | [router.go:476-545](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/routers/router.go#L476-L545) | URL 中的 `:key` 参数匹配 secret 进入路由 | ❌ **从未被 Gin Context 的 Param("key") 读取** |
+| **⑥？？？** | 全局搜索 `c.Param("key")` / `Param(["']secret` | — | ❌ **整个代码库 0 处匹配** |
+| **⑦？？？** | 全局搜索 `CallbackSecret` 用于校验的表达式 | 例如 `session.CallbackSecret == xxx` 等比较 | ❌ **仅出现于生成/传递处，从未出现于任何比较表达式** |
+
+#### 5.1.1 结论：CallbackSecret 的真实作用
+
+**CallbackSecret 从未被显式校验。** 它在整个安全体系中的角色是：
+
+- **被动防御（路径不可枚举性）**：由于 CallbackSecret 是 32 位密码学随机串（约 190 bits 熵），攻击者即使猜到了 SessionID 也无法构造完整的回调 URL。
+- **路由匹配屏障**：Gin 的路由是严格匹配的，`/callback/oss/{sessionID}/{key}` 中的 `{key}` 段必须存在才能进入这条路由。如果 URL 缺少第三段或第三段错误，直接返回 404，根本不会进入 UseUploadSession 中间件。
+
+> ⚠️ 但反过来说：如果攻击者通过某种方式（如日志泄露、中间人攻击）获得了完整的回调 URL（包含正确的 sessionID + callbackSecret），那么这个 callbackSecret 并不会被进一步校验——**只要 KV 中 session 还没过期，请求就会通过 UseUploadSession**。之后是否能继续通过，取决于驱动签名层（见 5.3 节）。
+
+### 5.2 SessionID 的完整生命周期追踪（代码证据链）
+
+SessionID 在系统中的角色是**主动校验要素**：
+
+| 阶段 | 代码位置 | 核心操作 | 是否"读取URL中的SessionID并校验"？ |
+|------|---------|---------|----------------------------------|
+| **①生成** | [manager/upload.go:80](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L80) | `sessionID := uuid.Must(uuid.NewV4()).String()` | — |
+| **②存入KV** | [manager/upload.go:136-144](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L136-L144) | `m.kv.Set("callback_" + sessionID, ...)`，带 TTL | — |
+| **③回调时读取URL** | [auth.go:195](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go#L195) | `sessionID := c.Param("sessionID")` | ✅ 是 |
+| **④校验1：非空** | [auth.go:196-198](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go#L196-L198) | 空则返回 `CodeParamErr` | ✅ 是 |
+| **⑤校验2：KV 存在** | [auth.go:200-204](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go#L200-L204) | `dep.KV().Get("callback_" + sessionID)`，不存在则 `CodeUploadSessionExpired` | ✅ 是（过期自动失效） |
+| **⑥校验3：策略类型匹配** | [auth.go:208-210](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go#L208-L210) | `callbackSession.Policy.Type != string(policyType)` → `CodePolicyNotAllowed` | ✅ 是（防止跨驱动冒用） |
+| **⑦恢复用户上下文** | [auth.go:212-214](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go#L212-L214) | `SetUserCtx(c, callbackSession.UID)` | 利用会话中的 UID |
+
+#### 5.2.1 SessionID 的真实作用
+
+**SessionID 是整个校验链的核心锚点**：
+- 它是从 URL 参数 → 恢复内存中完整会话对象的唯一桥梁
+- 它的校验包含"存在性（含过期TTL）+ 策略类型匹配"两道主动校验
+- 通过它恢复出来的 Policy 中包含了 AK/SK/SlaveKey 等驱动签名层需要的密钥（见 5.3 节）
+
+### 5.3 各存储驱动签名层的分工（代码证据链）
+
+驱动签名层**完全独立于 SessionID 和 CallbackSecret**，它们使用"存储商的 AK/SK 体系"进行签名验证。
+
+#### 5.3.1 签名层所用密钥从哪里来？
+
+所有驱动签名层的密钥都**来自 SessionID 恢复出来的会话对象**（即 `callbackSession.Policy`），而非来自 URL 参数：
+
+| 驱动 | 中间件 / 校验函数 | 使用的密钥来源 | 密钥形式 |
+|-----|-----------------|--------------|---------|
+| **OSS** | `OSSCallbackAuth()` → [VerifyCallbackSignature](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/driver/oss/callback.go#L90-L123) | 不需要会话中的 AK/SK！使用请求头中的 x-oss-pub-key-url（阿里云公钥） | RSA 公钥（远程下载，白名单校验） |
+| **七牛** | `QiniuCallbackValidate` → `mac.VerifyCallback` | `session.Policy.AccessKey` / `session.Policy.SecretKey` 重建 `qbox.Mac` | AK + SK |
+| **又拍云** | `UpyunCallbackAuth` → [ValidateCallback](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L356-L384) | `session.Policy.AccessKey` / `session.Policy.SecretKey` 传给 `sign()` 函数 | AK + SK（SK 先做 MD5） |
+| **远程从机** | `RemoteCallbackAuth()` → `auth.CheckRequest` | `session.Policy.Edges.Node.SlaveKey` | SlaveKey（HMAC） |
+| **COS/S3/KLS3/OBS** | **无此层** | 无驱动签名校验 | — |
+
+#### 5.3.2 驱动签名层的算法细节（与 SessionID/CallbackSecret 无关）
+
+各驱动签名校验算法**完全不包含** SessionID 或 CallbackSecret 作为签名原文的组成部分：
+
+| 驱动 | 签名原文（即被签名的数据） | SessionID/CallbackSecret 是否在原文中？ |
+|-----|------------------------|-------------------------------------|
+| **OSS** | `URL.Path + "\n" + Body` 的 MD5 值 | ❌ 不在。URL.Path 包含它们，但原文是整个 Path+Body，不单独解析验证 |
+| **七牛** | 请求的 Method / Path / Host / Content-Type / Body 等（SDK 内部封装） | ❌ 不在。SDK 按 HTTP 请求规范构造签名原文 |
+| **又拍云** | `"POST&" + URL.Path + "&" + Date + "&" + Content-MD5` | ❌ 不在。URL.Path 整体参与，但不单独验证 |
+| **远程从机** | 整个 HTTP 请求（Method/Path/Header/Body 等） | ❌ 不在。按通用 HMAC 请求签名规范 |
+
+> 注意：OSS/七牛/又拍云的签名原文中虽然包含 `URL.Path`（其中自然含有 `{sessionID}` 和 `{secret}`），但这是"整体 Path 字符串"作为签名输入，并不意味着对它们进行了**单独的、显式的**解析校验。只要攻击者截获了某次合法回调的完整请求（含所有Header/Body）并原样重放，签名就必然匹配。签名层真正防御的是"篡改请求内容"而非"重放请求"。
+
+### 5.4 三者的分工全景图
+
+```
+                 ┌─────────────────────────────────────────────────────────┐
+                 │                    整体安全防线                         │
+                 └─────────────────────────────────────────────────────────┘
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          │                           │                           │
+          ▼                           ▼                           ▼
+┌─────────────────────┐   ┌─────────────────────┐   ┌──────────────────────────┐
+│  第一层：路由屏障    │   │  第二层：会话锚点    │   │  第三层：驱动签名（可选） │
+│  (CallbackSecret)   │   │   (SessionID)       │   │  (存储商 AK/SK 体系)     │
+├─────────────────────┤   ├─────────────────────┤   ├──────────────────────────┤
+│                     │   │                     │   │                          │
+│ URL 必须包含正确的  │   │ 从 URL 中显式读取   │   │ 仅部分驱动有此层        │
+│ 第三段(secret) 才能 │   │ 并进行 3 道主动校验:│   │                          │
+│ 匹配路由，否则 404  │   │   ① 非空检查        │   │ • OSS: RSA 公钥验签      │
+│                     │   │   ② KV 存在+TTL     │   │ • 七牛: HMAC-SHA1(AK/SK)│
+│ ⚠️ 路由匹配成功后， │   │   ③ 策略类型匹配    │   │ • 又拍云: HMAC+Body MD5 │
+│ 此 secret 再无任    │   │                     │   │ • 远程: HMAC(SlaveKey)  │
+│ 何代码读取或校验    │   │ 恢复出会话后，将整  │   │ • COS/S3: 无此层       │
+│                     │   │ 个 Policy(含AK/SK)  │   │                          │
+│ 防御类型：被动防御  │   │ 塞入 Gin Context，供 │   │ 防御类型：主动校验      │
+│ 防的是：瞎猜路径    │   │ 后续中间件使用      │   │ 防的是：篡改请求内容     │
+│ 防不了：重放已知URL │   │                     │   │ 防不了：重放完整合法请求│
+│                     │   │ 防御类型：主动校验  │   │                          │
+│ 有效时间：永久      │   │ 防的是：过期/跨驱动 │   │                          │
+│ (只要 URL 正确即可) │   │ 冒用会话            │   │                          │
+│                     │   │                     │   │                          │
+│                     │   │ 有效时间：TTL(24h)  │   │                          │
+└─────────────────────┘   └─────────────────────┘   └──────────────────────────┘
+          │                           │                           │
+          └───────────────────────────┼───────────────────────────┘
+                                      │
+                                      ▼
+                        ┌──────────────────────────────┐
+                        │ 第四层：业务校验 + Complete  │
+                        │ （文件大小二次校验等）         │
+                        └──────────────────────────────┘
+```
+
+### 5.5 典型攻击场景下的防御能力评估
+
+| 攻击场景 | CallbackSecret 能否防御？ | SessionID 校验能否防御？ | 驱动签名层能否防御？ | 整体结论 |
+|---------|-------------------------|------------------------|-------------------|---------|
+| 攻击者瞎猜 URL 路径 | ✅ 32 位随机熵足够大，不可能枚举通过 | ✅ UUID v4 同样无法枚举 | — | ✅ 安全 |
+| 攻击者截获了某次合法回调的**完整请求**（含URL/Header/Body），在 TTL 内原样重放 | ❌ URL 正确即可匹配路由 | ❌ KV 仍在有效期 | ❌ 签名层校验的是"内容未被篡改"，重放即原样未篡改 | ⚠️ **存在重放风险**。TTL 是唯一防线（24h内仍可重放）。但重放成功只是再次调用 CompleteUpload，幂等或返回"会话已不存在"（若前次已成功清理 KV）。 |
+| 攻击者篡改了截获请求中的 Body 内容（如把 size 改大） | ❌ URL 不变仍可匹配路由 | ❌ KV 会话仍有效 | ✅ OSS/七牛/又拍云/远程的签名会校验失败 | ✅ 有签名层的驱动安全。COS/S3 等无签名层的驱动需依赖 CompleteUpload 阶段的 Head Object 校验。 |
+| 攻击者获取了有效 SessionID，但不知道 CallbackSecret | ✅ 无法构造正确的第三段 URL，路由不匹配，404 | —（根本进不来） | — | ✅ 安全。这是 CallbackSecret 的核心价值所在。 |
+| 攻击者用 OSS 存储策略的 SessionID 去调用 COS 回调路由 | ❌ URL 正确即可匹配对应路由（如果同时知道 secret） | ✅ 策略类型校验不通过，CodePolicyNotAllowed | — | ✅ SessionID 的策略类型校验挡住了跨驱动冒用。 |
+
+---
+
+## 六、异常分支处理全景
+
+### 6.1 凭证签发阶段失败
 
 **处理函数：** [OnUploadFailed](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L369-L397)
 
@@ -414,7 +554,7 @@ OnUploadFailed 清理逻辑：
 
 > 所有清理错误仅记录 Warning 日志，不中断错误返回链。
 
-### 5.2 用户主动取消上传
+### 6.2 用户主动取消上传
 
 **处理函数：** [CancelUploadSession](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L223-L287)
 
@@ -433,7 +573,7 @@ OnUploadFailed 清理逻辑：
 ④ m.kv.Delete("callback_", sessionID)
 ```
 
-### 5.3 回调过期（哨兵触发）
+### 6.3 回调过期（哨兵触发）
 
 **处理函数：** [UploadSentinelCheckTask.Do](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L501-L548)
 
@@ -455,7 +595,7 @@ OnUploadFailed 清理逻辑：
 
 > 注意：哨兵任务**不**删除 DB 中的占位实体，只清理物理存储资源。这是一种保守设计——宁可留下脏数据等待手动清理，也不误删。
 
-### 5.4 回调中 CompleteUpload 失败
+### 6.4 回调中 CompleteUpload 失败
 
 ProcessCallback 返回 error，Controller 返回非 200 状态码：
 
@@ -471,7 +611,7 @@ ProcessCallback 返回 error，Controller 返回非 200 状态码：
 
 ---
 
-## 六、三段路径的校验关联图
+## 七、三段路径的校验关联图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
@@ -502,23 +642,26 @@ ProcessCallback 返回 error，Controller 返回非 200 状态码：
 │                                                                                      │
 │  URL: /callback/{driver}/{sessionID}/{secret}                                        │
 │         │                                                                             │
-│         ├─① sessionID → KV 查找会话（过期则不存在）                                  │
-│         │    会话中取出: Policy.Type / UID / Size / LockToken / Policy.AK/SK 等       │
+│         ├─ 路由匹配屏障（第一层，无代码校验）                                         │
+│         │   {secret} 必须存在且非空才能进入此路由（否则 404）                         │
+│         │   ⚠️ 此层之后，secret 再也不被任何代码读取或校验                               │
 │         │                                                                             │
-│         ├─② Policy.Type 校验 == URL 中 driver 类型                                   │
+│         ├─① UseUploadSession（第二层，SessionID 主动校验）                            │
+│         │   sessionID → KV 查找会话（过期则不存在）                                   │
+│         │   会话中取出: Policy.Type / UID / Size / LockToken / Policy.AK/SK 等        │
+│         │   校验: 非空 + KV存在(TTL) + 策略类型匹配                                   │
 │         │                                                                             │
-│         ├─③ 恢复用户上下文 (UID)                                                      │
-│         │                                                                             │
-│         ├─④ 驱动签名校验（可选）                                                      │
-│         │    ├─ OSS:   RSA(MD5(Path+Body)) 用 Policy.AK 对应的公钥验证               │
-│         │    ├─ 七牛:  HMAC-SHA1 用 Policy.AK/SK 验证                                │
+│         ├─② 驱动签名校验（第三层，可选）                                              │
+│         │    ├─ OSS:   RSA(MD5(Path+Body)) 用阿里云公钥验证（白名单校验公钥来源）     │
+│         │    ├─ 七牛:  HMAC-SHA1 用 session.Policy.AK/SK 重建 Mac 验证               │
 │         │    ├─ 又拍云: HMAC-SHA1(MD5(SK)) + Body MD5 校验                           │
-│         │    └─ Remote:HMAC-SHA1 用 Policy.Node.SlaveKey 验证                         │
+│         │    ├─ Remote:HMAC-SHA1 用 session.Policy.Node.SlaveKey 验证                 │
+│         │    └─ COS/S3/KLS3/OBS: 无此层                                              │
 │         │                                                                             │
-│         ├─⑤ 业务校验（可选）                                                          │
+│         ├─③ 业务校验（第四层，可选）                                                  │
 │         │    └─ OSS: callbackBody.Size == session.Props.Size                         │
 │         │                                                                             │
-│         └─⑥ CompleteUpload                                                           │
+│         └─④ CompleteUpload                                                           │
 │              ├─ 驱动层: COS 额外 Head 校验文件大小                                    │
 │              ├─ DBFS层: 占位实体转正、释放锁、版本策略、事务提交                        │
 │              ├─ 取消哨兵任务                                                           │
@@ -528,28 +671,29 @@ ProcessCallback 返回 error，Controller 返回非 200 状态码：
 
 ---
 
-## 七、关键安全设计总结
+## 八、关键安全设计总结
 
 | 设计点 | 说明 | 风险考虑 |
 |-------|------|---------|
-| **CallbackSecret 32位随机** | 密码学安全随机，作为 URL 路径的一部分，无法枚举 | 靠随机性而非显式校验 |
-| **KV 中会话带 TTL** | 过期自动失效，防止会话永久有效 | TTL 内如果泄露仍可被冒用 |
-| **策略类型匹配** | OSS 会话不能用于 COS 回调 | 防止跨驱动攻击 |
-| **存储商签名校验** | OSS/七牛/又拍云有独立签名机制 | COS/S3 等依赖客户端回调，安全性较低，靠哨兵兜底 |
-| **OSS 公钥白名单** | 只接受 gosspublic.alicdn.com 的公钥 | 防止公钥伪造 |
-| **文件大小二次校验** | 回调 Body/Head Object 对比会话记录 | 防止篡改上传内容大小 |
-| **分布式锁** | PrepareUpload 时加锁，Complete 时解锁 | 防止并发写同一文件 |
-| **哨兵宽限期** | ExpireAt+5分钟，防止正常回调因网络延迟被误杀 | 极端延迟下仍可能误杀，但5分钟足够缓冲 |
+| **CallbackSecret 32位随机** | 密码学安全随机，作为 URL 路径的一部分，**仅提供路由匹配屏障+路径不可枚举性，不参与显式校验** | ⚠️ 一旦完整 URL 泄露，24h TTL 内可被重放（有签名层的驱动能防"篡改"但防不了"重放"）。**建议后续版本** 在 `uploadCallbackCheck` 中增加 `c.Param("key") == callbackSession.CallbackSecret` 的显式比对。 |
+| **KV 中会话带 TTL** | 过期自动失效，防止会话永久有效 | TTL 默认 24h 偏长，重放窗口较大；TTL 内如果泄露仍可被冒用 |
+| **SessionID 策略类型匹配** | OSS 会话不能用于 COS 回调（路由前缀+中间件双重校验） | 有效防止跨驱动冒用会话 |
+| **存储商签名校验（可选层）** | OSS/七牛/又拍云/远程节点有独立签名机制，基于存储商 AK/SK 体系 | ⚠️ COS/S3/KLS3/OBS 无此层，仅靠 URL 随机性+哨兵兜底，安全等级较低 |
+| **OSS 公钥白名单** | 只接受 gosspublic.alicdn.com 域下发的公钥，缓存 7 天 | 防止通过伪造公钥 URL 投毒 |
+| **文件大小二次校验** | OSS 在回调层校验 Body size，COS 在 CompleteUpload 层 Head Object 校验 | 防止篡改上传内容大小（COS/S3 等无签名驱动的关键兜底校验） |
+| **分布式锁** | PrepareUpload 时锁定目标路径加锁，Complete 时解锁 | 防止并发写同一文件造成数据错乱 |
+| **哨兵宽限期** | ExpireAt+5分钟，防止正常回调因网络延迟被误杀 | 极端延迟下仍可能误杀，但5分钟足够缓冲；保守策略不删 DB 占位 |
+| **签名层防篡改 / 防重放区分** | 驱动签名层（RSA/HMAC）只能防"请求内容被篡改" | ⚠️ **无法防重放攻击**。截获完整合法请求可在 TTL 内原样重放，幂等性是主要兜底（CompleteUpload 的二次处理或会因 KV 已删除而失败） |
 
 ---
 
-## 八、核心文件索引
+## 九、核心文件索引
 
 | 模块 | 文件路径 | 关键内容 |
 |------|---------|---------|
 | 上传管理器 | [manager/upload.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go) | CreateUploadSession / CompleteUpload / CancelUpload / OnUploadFailed / 哨兵任务 |
 | 会话定义 | [fs/fs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/fs.go) | UploadSession / UploadCredential / UploadProps 结构体 |
-| DBFS 会话准备 | [fs/dbfs/upload.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go) | PrepareUpload / CompleteUpload |
+| DBFS 会话准备 | [fs/dbfs/upload.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go) | PrepareUpload（CallbackSecret 生成位置） / CompleteUpload |
 | 回调控制器 | [controllers/callback.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/routers/controllers/callback.go) | Qiniu/OSS/Upyun 回调校验中间件 |
 | 回调服务 | [callback/upload.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/service/callback/upload.go) | ProcessCallback 入口 |
 | 认证中间件 | [middleware/auth.go](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/middleware/auth.go) | UseUploadSession / OSSCallbackAuth / RemoteCallbackAuth |
