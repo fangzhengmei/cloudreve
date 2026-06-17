@@ -571,9 +571,10 @@ if hdr == "" {
 ```
 
 关键细节：
-- 锁会话 `ls` 通过 `fs.LockSessionToContext` 注入 context，后续 FileManager 的 DBFS 操作能感知到当前持有的锁，避免死锁
-- src 锁失败时直接返回；dst 锁失败时会先释放已获取的 src 锁
-- 返回的 `release()` 函数按 dst → src 逆序释放
+- **会话在 src 与 dst 间累积**：`ctx` 在锁定 src 后通过 `fs.LockSessionToContext` 注入，第二个 `fm.Lock(ctx, ...)` 复用同一个 session 对象，因此返回的 `ls` 同时包含 src 和 dst 两个 token
+- **`release()` 真正删除临时锁**：闭包调用 `fm.Unlock(ctx, token)` → `f.ls.Unlock` → 从锁存储中移除节点，临时锁在请求结束后彻底消失
+- src 锁失败时直接返回；dst 锁失败时会先 `fm.Unlock` 释放已获取的 src 锁
+- 返回的 `release()` 按 dst → src 逆序释放
 
 **分支二：请求带 `If` 头（客户端已预先创建锁，需验证复用）**
 
@@ -603,7 +604,65 @@ return nil, nil, http.StatusPreconditionFailed, ErrLocked  // 所有 ifList 均�
 - `fm.ConfirmLock` 一次性接收一个 ifList 内的所有 token，**不是逐一确认**，而是整体校验该 ifList 是否匹配
 - `ErrConfirmationFailed` 时 `continue` 尝试下一个 ifList（OR 语义）
 - 全部 ifList 失败时返回 **412 Precondition Failed**（遵循 RFC 4918 §10.4.1）
-- 成功时复用客户端已有的锁，返回的 `release()` 是空操作（不释放客户端持有的锁）
+- **`release()` 释放 hold 而非删除锁**：`ConfirmLock` 内部调用 `f.ls.Confirm` → `memLS.Confirm` → `m.hold(n)` 将锁节点标记为 held（暂停过期回收），返回的 `release()` 调用 `m.unhold(n)` 恢复 held 标记并重新挂回过期堆。客户端持有的锁**不会被删除**，但 `release()` 本身**不是空操作**——它恢复了锁的正常过期流程（[memlock.go#L99-L116](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/lock/memlock.go#L99-L116)、[memlock.go#L347-L365](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/lock/memlock.go#L347-L365)）
+- **会话不跨 src/dst 累积**：与分支一不同，分支二对 src 和 dst 均传 `c`（未注入会话的原始 context），两次 `ConfirmLock` 各自创建独立的 session；返回的 `ls` 是最后一次（dst）的 session，src 的 session 仅被 `releaseSrc` 闭包捕获用于释放 hold
+
+#### 5.1.1a 三层锁复用链路 — 临时锁、ConfirmLock 与 DBFS 跳过重复加锁
+
+上面两个分支描述的是 `confirmLock` 自身的锁获取逻辑。但锁会话真正的复用发生在 **confirmLock 返回之后**——调用方将 `ls` 重新注入 context，使 FileManager 内部的 DBFS 操作能跳过重复加锁。三层关系如下：
+
+**第一层：confirmLock 创建/确认锁，产出 `ls`**
+
+- 分支一（临时锁）：`fm.Lock` → `acquireByPath` → `f.ls.Create` 在锁存储中**新建**锁节点，token 记入 `session.Tokens[lKey]`
+- 分支二（ConfirmLock 复用）：`fm.ConfirmLock` → `f.ls.Confirm` 在锁存储中**查找并 hold** 已有锁节点，token 记入 `session.Tokens[lKey]`
+
+两条路径都把“该 URI 已被当前会话锁定”这一事实写入 `session.Tokens` 映射表。
+
+**第二层：调用方重新注入 `ls`，打通 FileManager 感知**
+
+`confirmLock` 返回后，**调用方**（而非 confirmLock 自身）负责将会话注入请求级 context：
+
+```go
+// handlePut, handleMkcol, handleMove 等
+release, ls, status, err := confirmLock(c, fm, user, ancestor, nil, uri, nil)
+defer release()
+ctx := fs.LockSessionToContext(c, ls)   // ← 关键：将 ls 注入新 ctx
+// ...
+res, err := m.Update(ctx, fileData)      // FileManager 操作使用带会话的 ctx
+```
+
+此后所有 FileManager 操作（`Update`、`Create`、`MoveOrCopy`、`Rename` 等）接收的 `ctx` 均携带 `ls`。
+
+**第三层：DBFS 内部跳过重复加锁**
+
+当 FileManager 操作内部再次调用 `Lock` 或 `ConfirmLock` 锁定**同一 URI** 时，DBFS 层先检查 session：
+
+```go
+// dbfs/lock.go ConfirmLock (L46-L48)
+if _, ok := session.Tokens[lKey]; ok {
+    return func() {}, session, nil   // 跳过，返回空 release
+}
+
+// dbfs/lock.go acquireByPath (L131-L133)
+if _, ok := session.Tokens[lKey]; ok {
+    continue   // 跳过，不加入 lockDetails
+}
+```
+
+- `ConfirmLock` 命中已锁 key → 返回 `func() {}` 空操作 release，**不调用** `f.ls.Confirm`
+- `acquireByPath`（Lock 底层）命中已锁 key → `continue` 跳过，**不调用** `f.ls.Create`
+
+这就是 FileManager 在 WebDAV 写操作链路中不会对同一资源重复加锁的根本原因——不是靠“避免死锁”的模糊描述，而是靠 `session.Tokens[lKey]` 的精确查表跳过。
+
+**TokenStack 嵌套作用域**
+
+`LockSessionFromCtx`（[dbfs/lock.go#L267-L280](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/fs/dbfs/lock.go#L267-L280)）每次调用都会向 `TokenStack` 压入一个新空帧：
+
+```go
+l.TokenStack = append(l.TokenStack, make([]string, 0))
+```
+
+每次 `Lock`/`ConfirmLock` 将 `lKey` 追加到**当前栈顶帧**；`DBFS.Release` 只弹出栈顶帧并解锁该帧内的 token。这使得 FileManager 嵌套操作（如 MoveOrCopy 内部再调 Rename）各自拥有独立的锁作用域，内层 Release 不会误释放外层锁。
 
 #### 5.1.2 LOCK 失败的自动回滚
 
