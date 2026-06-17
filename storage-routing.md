@@ -539,24 +539,71 @@ func (m *manager) GetStorageDriver(ctx context.Context, policy *ent.StoragePolic
 
 WebDAV 层在协议层面有自己的错误处理和资源释放机制，与 FileManager 层的机制独立但协同。
 
-#### 5.1.1 锁的自动释放
+#### 5.1.1 锁的获取与释放 — confirmLock
 
 [webdav.go#L97-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/webdav/webdav.go#L97-L189) — `confirmLock`
 
-WebDAV 所有写操作（PUT/DELETE/MKCOL/COPY/MOVE/LOCK/PROPPATCH）在进入 FileManager 之前，先通过 `confirmLock` 获取 WebDAV 协议级锁，并通过 `defer release()` 保证在函数返回时自动释放：
+WebDAV 所有写操作（PUT/DELETE/MKCOL/COPY/MOVE/LOCK/PROPPATCH）在进入 FileManager 之前，先通过 `confirmLock` 获取/确认锁，并通过 `defer release()` 保证在函数返回时自动释放。该函数同时支持 src 和 dst 两个资源的锁（用于 COPY/MOVE）。
+
+**分支一：请求不带 `If` 头（客户端未预先创建锁）**
+
+此时系统创建**临时锁**，用于防止与其他客户端的锁冲突，请求结束时自动释放：
 
 ```go
-release, ls, status, err := confirmLock(c, fm, user, ancestor, nil, uri, nil)
-if err != nil {
-    return status, err
+if hdr == "" {
+    srcToken, dstToken := "", ""
+    ap := fs.LockApp(fs.ApplicationDAV)
+    if src != nil {
+        ls, err = fm.Lock(ctx, -1, user, true, ap, src, "")
+        srcToken = ls.LastToken()
+        ctx = fs.LockSessionToContext(ctx, ls)  // 锁会话注入上下文，后续 FileManager 操作可感知
+    }
+    if dst != nil {
+        ls, err = fm.Lock(ctx, -1, user, true, ap, dst, "")
+        dstToken = ls.LastToken()
+        ctx = fs.LockSessionToContext(ctx, ls)
+    }
+    return func() {  // defer release()
+        if dstToken != "" { _ = fm.Unlock(ctx, dstToken) }
+        if srcToken != "" { _ = fm.Unlock(ctx, srcToken) }
+    }, ls, 0, nil
 }
-defer release()
 ```
 
-- 若请求不带 `If` 头 → 创建临时锁（自动随请求结束释放）
-- 若请求带 `If` 头 → 遍历所有条件 token 逐一确认，第一个匹配成功的生效
-- 所有 token 均失败 → 返回 412 Precondition Failed
-- 目标被他人锁定 → 返回 423 Locked
+关键细节：
+- 锁会话 `ls` 通过 `fs.LockSessionToContext` 注入 context，后续 FileManager 的 DBFS 操作能感知到当前持有的锁，避免死锁
+- src 锁失败时直接返回；dst 锁失败时会先释放已获取的 src 锁
+- 返回的 `release()` 函数按 dst → src 逆序释放
+
+**分支二：请求带 `If` 头（客户端已预先创建锁，需验证复用）**
+
+`If` 头按 WebDAV 规范解析为 ifLists 的**析取（OR 语义）**——只要任意一个 ifList 验证通过即可：
+
+```go
+ih, ok := parseIfHeader(hdr)
+for _, l := range ih.lists {
+    if src != nil {
+        releaseSrc, ls, err = fm.ConfirmLock(c, srcAnc, src, tokens...)  // 传入该 ifList 的所有 token
+        if errors.Is(err, lock.ErrConfirmationFailed) {
+            continue  // 当前 ifList 失败，尝试下一个
+        }
+    }
+    if dst != nil {
+        releaseDst, ls, err = fm.ConfirmLock(c, dstAnc, dst, tokens...)
+        if errors.Is(err, lock.ErrConfirmationFailed) {
+            continue
+        }
+    }
+    return func() { releaseDst(); releaseSrc() }, ls, 0, nil  // 第一个成功的 ifList 生效
+}
+return nil, nil, http.StatusPreconditionFailed, ErrLocked  // 所有 ifList 均失败 → 412
+```
+
+关键细节：
+- `fm.ConfirmLock` 一次性接收一个 ifList 内的所有 token，**不是逐一确认**，而是整体校验该 ifList 是否匹配
+- `ErrConfirmationFailed` 时 `continue` 尝试下一个 ifList（OR 语义）
+- 全部 ifList 失败时返回 **412 Precondition Failed**（遵循 RFC 4918 §10.4.1）
+- 成功时复用客户端已有的锁，返回的 `release()` 是空操作（不释放客户端持有的锁）
 
 #### 5.1.2 LOCK 失败的自动回滚
 
@@ -686,11 +733,15 @@ Entity 回收是异步批量执行的，包含以下容错：
 - **不存在对象静默忽略**：Delete 时 `ErrCodeNoSuchKey` 错误被静默忽略，继续处理其他对象
 - **批量删除自动分批**：超过 1000 个 key 时自动分多批调用 `DeleteObjects`
 - **分片上传重试**：`s3manager.Uploader` 内置分片并发与失败重试
-- **MultipartUpload 自动过期**：S3 侧有生命周期规则，未完成的分片上传会自动清理
+- **取消上传主动清理**：`CancelToken` 通过 `AbortMultipartUploadWithContext` 主动中止未完成的分片上传（[s3/s3.go#L468-L475](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L468-L475)）；Put 流程内部失败时 `cancelUpload` 辅助函数亦会调用 `AbortMultipartUpload` 清理残留分片（[s3/s3.go#L477-L485](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L477-L485)）
+- **分片完成校验**：`CompleteUpload` 通过 HEAD Object（`Meta`）校验已上传文件大小是否与 `session.Props.Size` 一致，不匹配则返回 `CodeMetaMismatch` 错误（[s3/s3.go#L504-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L504-L523)）；仅当 `SentinelTaskID != 0`（哨兵模式）时才执行校验，否则直接返回 nil
 
 #### 5.3.3 Remote 驱动（Master ↔ Slave 间）
 
-- **分片重试**：Master 侧 `uploadChunk` 失败时，通过 `backoff.ConstantBackoff` 指数退避重试，最多重试 `ChunkRetryLimit` 次
+- **固定间隔分片重试**：Master 侧 `remoteClient.Upload` 使用 `backoff.ConstantBackoff`（[backoff.go#L20-L46](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/chunk/backoff/backoff.go#L20-L46)），**固定休眠 5 秒**（`chunkRetrySleep = 5 * time.Second`，[client.go#L32](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/remote/client.go#L32)），最多重试 `ChunkRetryLimit` 次。注意是**固定间隔**而非指数退避；若错误是 `RetryableError` 且携带 HTTP `retry-after` 头，则改用 `retry-after` 指定的时间。
+- **每分片独立重试**：重试发生在 `chunk.ChunkGroup.Process` 内部（[chunk.go#L73-L131](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/chunk/chunk.go#L73-L131)），切换到下一分片时调用 `backoff.Reset()` 重置计数器（[chunk.go#L159-L163](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/chunk/chunk.go#L159-L163)）。重试前提：错误非 `context.Canceled` 且（文件可 Seek 或临时缓冲可用）。
+- **重试缓冲**：若启用 `UseChunkBuffer` 且文件不可 Seek，`omitErrorTeeReader` 将分片内容 tee 到临时文件，失败后从临时文件重试，避免数据丢失。
+- **整批失败清理**：任一分片重试耗尽仍失败 → 调用 `DeleteUploadSession` 清理 Slave 侧上传会话（[client.go#L121-L129](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/remote/client.go#L121-L129)），返回错误。
 - **上传会话缓存失效兜底**：Slave 侧上传会话过期返回 `CodeUploadSessionExpired`，Master 侧感知后整体失败
 - **删除失败列表回传**：Slave 侧删除失败的文件路径通过响应体回传给 Master，Master 侧 `AggregateError` 汇总
 - **HMAC 签名防篡改**：所有 Master ↔ Slave 通信均带 HMAC 签名，防止请求被篡改
@@ -730,8 +781,8 @@ Entity 回收是异步批量执行的，包含以下容错：
 | Source 实现 | 返回 `"not implemented"` 错误 | [s3/s3.go#L296-L332](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L296-L332) — `GetObjectRequest.Presign` 预签名 URL，7 天 TTL，公有桶去签名 | [remote/remote.go#L111-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/remote/remote.go#L111-L136) — 组装从机 `/api/v4/slave/file/content/...` URL，HMAC 签名 |
 | Token 实现 | [local/local.go#L208-L235](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/local/local.go#L208-L235) — 本地创建占位文件，可选预分配，返回会话 | [s3/s3.go#L335-L411](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L335-L411) — `CreateMultipartUpload` + 每个分片 `UploadPartRequest.Presign` + `CompleteMultipartUploadRequest.Presign` | [remote/remote.go#L139-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/remote/remote.go#L139-L159) — 调用从机 `CreateUploadSession`，返回签名后的从机上传 URL |
 | Capabilities | `ProxyRequired=true`, `InboundGet=true`（强制内部代理，支持直接读 *os.File） | `UploadSentinelRequired=true`（不支持回调，需哨兵监控） | 无 StaticFeatures（走默认路径） |
-| CompleteUpload | [local/local.go#L255-L295](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/local/local.go#L255-L295) — Slave 侧回调 Master（当作为 remote 策略的影子驱动时） | 空实现 | 空实现 |
-| CancelToken | 空实现 | 未实现（S3 MultipartUpload 自动过期） | `DeleteUploadSession` RPC 到从机 |
+| CompleteUpload | [local/local.go#L255-L295](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/local/local.go#L255-L295) — Slave 侧回调 Master（当作为 remote 策略的影子驱动时） | [s3/s3.go#L504-L523](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L504-L523) — HEAD Object 校验文件大小，不匹配返回 `CodeMetaMismatch`（仅哨兵模式 `SentinelTaskID != 0`） | 空实现 |
+| CancelToken | 空实现 | [s3/s3.go#L468-L475](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/s3/s3.go#L468-L475) — `AbortMultipartUploadWithContext` 主动取消 | `DeleteUploadSession` RPC 到从机 |
 
 ### 6.4 EntitySource.Serve — 下载响应决策
 
