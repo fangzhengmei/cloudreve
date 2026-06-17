@@ -1,6 +1,8 @@
 # Cloudreve 存储路由机制详解
 
-本文档对照代码讲清：当一个请求（上传/下载/删除等）到达 Cloudreve 后，系统如何决定使用哪种存储后端（S3、本地盘、WebDAV/Remote 等），请求沿哪条路径转发到具体驱动，以及在出错时如何兜底。
+本文档对照代码讲清：当一个请求（上传/下载/删除等）到达 Cloudreve 后，系统如何决定使用哪种存储后端（S3、本地盘、Remote 从机等），请求沿哪条路径转发到具体驱动，以及在出错时如何兜底。
+
+> **易混概念澄清**：WebDAV 与 remote 是两个完全不同层次的概念，分属协议入口层和存储驱动层，详见 [第 1.4 节](#14-两层易混概念辨析-webdav入口协议-vs-remote从机存储策略)。
 
 ---
 
@@ -22,7 +24,7 @@ PolicyTypeCos    = "cos"       // 腾讯云 COS
 PolicyTypeS3     = "s3"        // S3 兼容
 PolicyTypeKs3    = "ks3"       // 金山云 KS3
 PolicyTypeOd     = "onedrive"  // OneDrive
-PolicyTypeRemote = "remote"    // 远程从机（本质上走 HTTP RPC，可对接 WebDAV 等）
+PolicyTypeRemote = "remote"    // 远程从机（Master ↔ Slave 间 HTTP RPC）
 PolicyTypeObs    = "obs"       // 华为云 OBS
 ```
 
@@ -39,6 +41,61 @@ PolicyTypeObs    = "obs"       // 华为云 OBS
 - [fs.go#DbEntity.PolicyID](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/fs/fs.go#L780-L782) — `e.model.StoragePolicyEntities` 即为 PolicyID
 
 这意味着：同一文件的不同版本（Entity）可以存储在不同的后端策略上。
+
+### 1.4 两层易混概念辨析：WebDAV（入口协议） vs Remote（从机存储策略）
+
+这是两个完全不同层次的概念，切勿混淆：
+
+| 维度 | WebDAV | Remote（从机策略） |
+|------|--------|-------------------|
+| **所处层次** | 协议入口层（最上层，面向客户端） | 存储驱动层（底层，面向存储后端） |
+| **代码位置** | `pkg/webdav/` + `middleware/auth.go#WebDAVAuth` | `pkg/filemanager/driver/remote/` |
+| **面向对象** | 终端用户的 WebDAV 客户端（Finder/资源管理器等） | Master 节点 ↔ Slave 节点的内部 RPC |
+| **核心作用** | 把 WebDAV 协议请求（PUT/GET/LOCK/MKCOL…）翻译成 FileManager 的内部调用 | 作为 `driver.Handler` 的一个实现，通过 HTTP RPC 调用 Slave 节点的存储能力 |
+| **鉴权方式** | HTTP Basic Auth → DAV 账号 → 用户 | HMAC 签名（SlaveKey）+ 节点 ID |
+| **是否有状态** | 有用户上下文（关联 Group / 权限校验） | Master 侧有状态，Slave 侧 stateless |
+| **与策略的关系** | 不关心具体存储策略，全部交给 FileManager | 本身就是一种策略类型（`PolicyTypeRemote`），与 local/s3 平级 |
+| **挂载点 / 入口** | `/dav/*` 路由 | `GetStorageDriver` 中 switch 分支的一个 case |
+
+**一句话总结**：WebDAV 是"门"，客户端从这扇门进来；remote 是"快递员"，Master 节点派它去 Slave 节点取货/送货。两扇门（Web 端 REST API 和 WebDAV）都通往同一个大厅（FileManager），大厅里有多个快递员（local/s3/remote/oss/cos/...）。
+
+**完整的三层架构**（自上而下）：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  协议入口层                                              │
+│  ┌──────────────┐   ┌──────────────┐                    │
+│  │  Web API     │   │   WebDAV     │                    │
+│  │  /api/v4/*   │   │   /dav/*     │                    │
+│  │ Session Auth │   │  Basic Auth  │                    │
+│  └──────┬───────┘   └──────┬───────┘                    │
+└─────────┼──────────────────┼────────────────────────────┘
+          │                  │
+          ▼                  ▼
+┌─────────────────────────────────────────────────────────┐
+│  FileManager 层（业务逻辑层）                            │
+│  · DBFS（数据库文件系统）                                │
+│  · 策略匹配（getPreferredPolicy / getEntityPolicyDriver）│
+│  · 驱动分发（GetStorageDriver）                         │
+│  · 版本控制 / 锁 / 回收 / 缩略图 / 加密                 │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│  存储驱动层（driver.Handler 实现）                      │
+│  ┌────────┐ ┌──────┐ ┌────────┐ ┌──────┐ ┌──────────┐   │
+│  │ local  │ │ s3   │ │ remote │ │ oss  │ │ onedrive │   │
+│  │ (本地盘)│ │ (S3) │ │ (从机) │ │ (OSS)│ │ (OneDrive)│  │
+│  └────────┘ └──────┘ └───┬────┘ └──────┘ └──────────┘   │
+│                           │                              │
+│                      HTTP RPC                           │
+│                           │                              │
+│                  ┌────────▼───────┐                     │
+│                  │  Slave 节点    │                     │
+│                  │  local 驱动    │                     │
+│                  └────────────────┘                     │
+└─────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -194,62 +251,169 @@ func ServeHTTP(c *gin.Context) {
 [webdav.go#L227-L285](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/webdav/webdav.go#L227-L285) — `handlePut`
 
 ```
-PUT /dav/path/to/file.ext
-  → WebDAVAuth 中间件 (Basic Auth)
-  → stripPrefix: 剥离 /dav 前缀，得到相对路径
-  → fm.SharedAddressTranslation: 路径 → fs.File (ancestor) + fs.URI
-  → DavAccountDisableSysFiles 检查: 以 "." 开头的文件是否被禁止
-  → confirmLock: 确认/创建文件锁（WebDAV 锁机制）
-  → request.SniffContentLength(c.Request): 从 HTTP 请求嗅探文件大小
-  → 构造 fs.UploadRequest (Mode=ModeOverwrite)
-  → m.Update(ctx, fileData)                ← 和 Web 端上传复用
-       │
-       ├── fs.PrepareUpload(ctx, req)      // DBFS 创建/更新 Entity（走 getPreferredPolicy 匹配策略）
-       ├── m.Upload(ctx, req, policy, session)
-       │    └── GetStorageDriver(...)       // 策略→驱动分发
-       │         ├── local.Driver.Put      // 本地盘: os.OpenFile + io.Copy
-       │         ├── s3.Driver.Put         // S3: s3manager.Uploader.UploadWithContext
-       │         ├── remote.Driver.Put     // 远程从机: uploadClient.Upload (HTTP RPC)
-       │         └── ... (cos/oss/obs/ks3/qiniu/upyun/onedrive)
-       └── m.CompleteUpload(ctx, session)
+╔══════════════════════════════════════════════════════════════════╗
+║  WebDAV 协议入口层（pkg/webdav/）                                 ║
+║  职责：协议翻译、鉴权、锁管理、路径转换                            ║
+╠══════════════════════════════════════════════════════════════════╣
+║  PUT /dav/path/to/file.ext                                       ║
+║    → WebDAVAuth 中间件 (Basic Auth → DAV 账号 → 用户)           ║
+║    → stripPrefix: 剥离 /dav 前缀，得到相对路径                   ║
+║    → fm.SharedAddressTranslation: 路径 → fs.File + fs.URI       ║
+║    → DavAccountDisableSysFiles 检查                              ║
+║    → confirmLock: 确认/创建 WebDAV 协议级锁                     ║
+║    → request.SniffContentLength: 嗅探文件大小                    ║
+║    → 构造 fs.UploadRequest (Mode=ModeOverwrite)                  ║
+╚═════════════════════════╤════════════════════════════════════════╝
+                          │
+          ──── WebDAV / FileManager 边界 ────
+                          │
+╔═════════════════════════▼════════════════════════════════════════╗
+║  FileManager 层（pkg/filemanager/manager/ + fs/dbfs/）           ║
+║  职责：策略匹配、版本控制、加密、回收、实体管理                     ║
+╠══════════════════════════════════════════════════════════════════╣
+║  m.Update(ctx, fileData)                                         ║
+║    ├── fs.PrepareUpload(ctx, req)                                ║
+║    │    └── getPreferredPolicy(ctx, ancestor)  // Group→Policy  ║
+║    ├── m.Upload(ctx, req, policy, session)                       ║
+║    │    └── GetStorageDriver(...)  // 策略→驱动分发              ║
+║    │         ┌───────────────────────────────────────────┐      ║
+║    │         │  存储驱动层（driver.Handler 实现）        │      ║
+║    │         │  · local.Driver.Put  → 本地磁盘            │      ║
+║    │         │  · s3.Driver.Put     → S3 兼容存储         │      ║
+║    │         │  · remote.Driver.Put → Slave 节点 HTTP RPC│      ║
+║    │         │  · cos/oss/obs/ks3/qiniu/upyun/onedrive   │      ║
+║    │         └───────────────────────────────────────────┘      ║
+║    └── m.CompleteUpload(ctx, session)                           ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
 
-**关键点**：WebDAV PUT 的核心上传执行 (`manager.Upload` → `driver.Handler.Put`) 与 Web 端 REST API 上传 **完全走同一条代码路径**，策略匹配、驱动分发、加密、失败清理机制全部复用。差异仅在于：
-- WebDAV 使用 `ModeOverwrite` 覆盖已有文件
-- WebDAV 不通过上传会话凭证（Token），直接将 HTTP Body 流交给驱动
-- WebDAV 自带 WebDAV 协议级锁（`confirmLock`），与文件管理器内部锁并存
+**两层边界点**：WebDAV 层在 `m.Update()` 调用处交出控制权，之后的策略匹配、驱动分发、版本控制完全由 FileManager 处理，WebDAV 不感知也不干预。
+
+**关键点**：
+- WebDAV PUT 的核心上传执行 (`manager.Upload` → `driver.Handler.Put`) 与 Web 端 REST API 上传 **完全走同一条代码路径**，策略匹配、驱动分发、加密、失败清理机制全部复用
+- 差异仅三点：WebDAV 用 `ModeOverwrite` 覆盖、直接传 HTTP Body 流、带 WebDAV 协议级锁（`confirmLock`）
+- WebDAV 协议锁（`fs.Lock` / DBFS lock 表）与文件管理器内部锁（上传锁、目录锁）是两套独立的锁机制，WebDAV 写操作会同时持有两把
+
+### 3.3.1 Remote 策略的跨节点上传链路（Master → Slave）
+
+当用户组绑定的存储策略类型是 `remote` 时，`GetStorageDriver` 返回 `remote.Driver`，上传请求会跨节点转发到 Slave 节点。
+
+**Master 侧（remote.Driver.Put）**：
+[client.go#L95-L139](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/remote/client.go#L95-L139) — `remoteClient.Upload`
+
+```
+remote.Driver.Put(file)
+  ├── 构造 UploadSession（生成 UUID、设置过期时间）
+  ├── CreateUploadSession(ctx, session, overwrite)
+  │    └── POST /api/v4/slave/upload/session  → Slave 节点
+  │         └── HMAC 签名 (SlaveKey)
+  ├── chunk.NewChunkGroup(file, ...)  // 分片 + 重试
+  └── for each chunk:
+       └── uploadChunk(...)  // PUT /api/v4/slave/upload/{id}?chunk=n
+```
+
+**Slave 侧（从机处理上传）**：
+
+1. 创建上传会话：[slave.go#L88-L107](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/service/explorer/slave.go#L88-L107) — `SlaveCreateUploadSessionService.Create`
+   - `manager.NewFileManager(dep, nil)` → 因为 `u == nil`，创建 **stateless FileManager**
+   - `m.CreateUploadSession(c, req, fs.WithUploadSession(&service.Session))`
+   - stateless 模式下 FS 为 nil，上传会话仅存于 KV 缓存
+
+2. 接收分片上传：[upload.go#L135-L154](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/service/explorer/upload.go#L135-L154) — `UploadService.SlaveUpload`
+   - 从 KV 取上传会话
+   - `manager.NewFileManager(dep, nil)` → stateless
+   - `processChunkUpload` → 分片写入本地文件
+   - 内部走 local 驱动的 Put 逻辑
+
+3. 上传完成回调：上传完成后，Slave 节点回调 Master 的 `MasterSlaveCallbackUrl`
+   - Master 收到回调 → `CompleteUpload` → 标记 Entity 为有效状态
+
+**Master ↔ Slave 的边界**：
+- Master 侧的 `remote.Driver.Put` 通过 `remoteClient` 发起 HTTP 请求
+- Slave 侧的 `SlaveUpload` / `SlaveGetUploadSession` 等 controller 接收请求
+- 通信鉴权：HMAC 签名 + SlaveKey + 节点 ID
+- Slave 侧使用 **stateless FileManager**（无用户、无 DBFS），直接操作本地文件
 
 ### 3.4 WebDAV GET → 文件管理层的完整路径
 
 [webdav.go#L334-L372](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/webdav/webdav.go#L334-L372) — `handleGetHeadPost`
 
 ```
-GET /dav/path/to/file.ext
-  → WebDAVAuth 中间件
-  → stripPrefix
-  → fm.SharedAddressTranslation: 路径 → target (fs.File)
-  → target.Type() 必须是 FileTypeFile
-  → fm.GetEntitySource(c, target.PrimaryEntityID())  ← 和 Web 端下载复用
-       │
-       ├── fs.GetEntity(ctx, entityID)              // 从 DB 取 Entity
-       ├── getEntityPolicyDriver(ctx, entity, nil)  // Entity.PolicyID → Policy → Driver
-       └── entitysource.NewEntitySource(...)
-  → es.Apply(WithSpeedLimit(user.Group.SpeedLimit))
-  → 决策: ShouldInternalProxy() 或 (DavAccountProxy 且 GroupPermissionWebDAVProxy)
-       │
-       ├── true  → es.Serve(c.Writer, c.Request)     // 反代/流式响应
-       │     ├── IsLocal()
-       │     │    └── local.Driver.Open + io.Copy    // 本地盘：直接读文件
-       │     └── !IsLocal()
-       │          ├── handler.Source(...)             // S3/remote: 取预签名 URL
-       │          └── httputil.ReverseProxy           // Cloudreve 反向代理到后端
-       └── false → es.Url(...) + c.Redirect(302, src.Url)
-                  └── s3.Driver.Source → Presign   // 302 跳转到 S3 预签名 URL
+╔══════════════════════════════════════════════════════════════════╗
+║  WebDAV 协议入口层（pkg/webdav/）                                 ║
+║  职责：协议翻译、鉴权、Range 透传、强制代理决策                    ║
+╠══════════════════════════════════════════════════════════════════╣
+║  GET /dav/path/to/file.ext                                       ║
+║    → WebDAVAuth 中间件                                          ║
+║    → stripPrefix                                                ║
+║    → fm.SharedAddressTranslation: 路径 → target (fs.File)       ║
+║    → target.Type() 必须是 FileTypeFile                          ║
+║    → fm.GetEntitySource(c, target.PrimaryEntityID())            ║
+╚═════════════════════════╤════════════════════════════════════════╝
+                          │
+          ──── WebDAV / FileManager 边界 ────
+                          │
+╔═════════════════════════▼════════════════════════════════════════╗
+║  FileManager 层 + EntitySource 层                                ║
+╠══════════════════════════════════════════════════════════════════╣
+║    ├── fs.GetEntity(ctx, entityID)        // 从 DB 取 Entity    ║
+║    ├── getEntityPolicyDriver(ctx, entity, nil)                  ║
+║    │    └── GetStorageDriver(policy)    // Entity.PolicyID→驱动 ║
+║    ├── entitysource.NewEntitySource(...)                        ║
+║    ├── es.Apply(WithSpeedLimit(...))                            ║
+║    └── 决策: ShouldInternalProxy() 或 DavAccountProxy           ║
+║         │                                                       ║
+║         ├── true  → es.Serve(c.Writer, c.Request)               ║
+║         │     ├── IsLocal()                                     ║
+║         │     │    └── local.Driver.Open + http.ServeContent    ║
+║         │     └── !IsLocal()                                    ║
+║         │          ├── handler.Source(...)  // 取预签名 URL     ║
+║         │          └── httputil.ReverseProxy  // 反向代理        ║
+║         └── false → es.Url(...) + c.Redirect(302, src.Url)     ║
+║                   └── s3/remote.Driver.Source → 预签名 URL     ║
+╚══════════════════════════════════════════════════════════════════╝
 ```
+
+**WebDAV 层的特殊决策**：当 DAV 账号开启了 `DavAccountProxy` 且用户组有 `GroupPermissionWebDAVProxy` 权限时，强制走 Cloudreve 内部代理。这是因为某些 WebDAV 客户端（如旧版 macOS Finder）不支持 302 重定向下载。
 
 **WebDAV GET 与 Web 端 GET 的复用关系**：
 - `GetEntitySource`、`getEntityPolicyDriver`、`NewEntitySource`、`EntitySource.Serve` 完全复用
-- WebDAV 额外增加了一层代理决策：当 DAV 账号开启了 `DavAccountProxy` 且用户组有 `GroupPermissionWebDAVProxy` 权限时，强制走 Cloudreve 内部代理（某些 WebDAV 客户端不支持 302 跳转）
+- 差异：WebDAV 额外增加了一层 `DavAccountProxy` 强制代理决策
+
+### 3.4.1 Remote 策略的跨节点下载链路（Master → Slave）
+
+当 Entity 绑定的策略是 `remote` 类型时，下载链路会跨节点转发到 Slave 节点。
+
+**Master 侧（remote.Driver.Source）**：
+[remote.go#L111-L136](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/remote/remote.go#L111-L136) — `Driver.Source`
+
+```
+remote.Driver.Source(ctx, e, args)
+  ├── routes.SlaveFileContentUrl(...)  // 组装从机下载 URL
+  │    └─ /api/v4/slave/file/content/{src}/{name}
+  ├── auth.SignURI(...)  // HMAC 签名 URL
+  └── 返回签名后的 Slave URL
+```
+
+**Slave 侧（从机提供下载）**：
+[slave.go#L41-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/service/explorer/slave.go#L41-L76) — `EntityDownloadService.SlaveServe`
+
+```
+SlaveServe(c)
+  ├── base64 解码 src → 本地文件路径
+  ├── local.NewLocalFileEntity(types.EntityTypeVersion, path)  // 构造本地实体
+  ├── m.GetEntitySource(c, 0, fs.WithEntity(entity))
+  │    └── stateless FileManager + local 驱动
+  └── entitySource.Serve(c.Writer, c.Request, ...)
+       └── local.Driver.Open + http.ServeContent  // 直接读本地文件
+```
+
+**Master → Slave 的下载边界**：
+- Master 侧 `EntitySource.Serve` 决定走反代还是 302
+  - 反代模式：Master 作为反向代理，从 Slave 拉取数据再转发给客户端（增加延迟，隐藏 Slave 地址）
+  - 302 模式：Master 返回签名的 Slave URL，客户端直接访问 Slave（速度快，暴露 Slave 地址）
+- Slave 侧始终走 local 驱动直接读取本地文件
+- 两种模式下 Master 与 Slave 的鉴权均为 HMAC URL 签名
 
 ### 3.5 下载/获取文件 URL 链路
 
@@ -367,77 +531,19 @@ func (m *manager) GetStorageDriver(ctx context.Context, policy *ent.StoragePolic
 
 ---
 
-## 5. 回退兜底机制
+## 5. 回退兜底机制（按分层整理）
 
-### 5.1 策略未找到时的兜底
+回退兜底机制分布在三层中，各司其职，层层递进。
 
-[manager/fs.go#L92-L117](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/fs.go#L98-L100)
+### 5.1 协议入口层兜底（WebDAV 特有）
 
-```go
-if policyID == 0 {
-    policy = &ent.StoragePolicy{Type: types.PolicyTypeLocal, Settings: &types.PolicySetting{}}
-}
-```
+WebDAV 层在协议层面有自己的错误处理和资源释放机制，与 FileManager 层的机制独立但协同。
 
-Entity 没有绑定策略时，默认回退到空本地策略。
-
-### 5.2 上传失败时的清理 — OnUploadFailed
-
-[manager/upload.go#L369-L397](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/upload.go#L369-L397)
-
-上传失败后分两种模式处理：
-
-**Master 模式**：
-1. 释放文件锁 (`Unlock`)
-2. 若新建了占位文件 → 删除占位文件
-3. 若为更新已有文件 → 回滚版本控制（删除新版本 Entity）
-
-**Slave 模式**：
-1. 获取驱动并删除已上传的物理文件
-2. 日志记录失败
-
-### 5.3 上传哨兵 — UploadSentinelCheckTask
-
-[manager/upload.go#L447-L499](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/upload.go#L447-L499)
-
-对于不支持合规回调的存储策略（设置了 `HandlerCapabilityUploadSentinelRequired`），系统在上传会话创建后同时创建一个延迟执行的哨兵任务：
-
-1. 任务在 `上传会话过期时间 + 5分钟` 后执行
-2. 执行时检查上传会话是否已通过回调完成
-3. 若未完成 → 删除占位 Entity 的物理文件 + 取消上传 Token
-4. 若已完成 → 任务自动标记为 completed
-
-### 5.4 实体回收 — RecycleEntities
-
-[manager/recycle.go#L191-L289](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/recycle.go#L191-L289)
-
-Entity 回收是异步批量执行的，包含以下容错：
-
-1. **按策略分组**：同一策略的 Entity 一起删除，避免频繁切换驱动
-2. **批量分片**：每 100 个 Entity 一批，避免单次请求过大
-3. **部分失败隔离**：使用 `AggregateError` 收集每个 Entity 的独立错误，单个删除失败不影响其他
-4. **force 模式**：强制模式下即使物理文件删除失败，仍从数据库中移除 Entity 记录
-5. ** unlink-only 处理**：标记为 `UnlinkOnly` 的 Entity 只解除 DB 记录关联，不删除物理文件
-
-### 5.5 下载 URL 缓存与重试
-
-[manager/entity.go#L260-L303](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/entity.go#L260-L303) — 下载 URL 有 KV 缓存，缓存有效期比 URL 实际过期时间短一个 `EntityUrlCacheMargin`。
-
-[entitysource/entitysource.go#L710-L726](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/entitysource/entitysource.go#L710-L726) — 非本地文件读取时也有 URL 缓存，过期前 1 分钟刷新。
-
-### 5.6 自定义代理 — ApplyProxyIfNeeded
-
-[driver/util.go#L12-L42](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/util.go#L12-L42)
-
-当策略配置了 `CustomProxy = true` 时，下载 URL 会被改写为代理服务器地址，保留原始路径和查询参数。这是一个灵活的中间层代理方案。
-
-### 5.7 WebDAV 特有的兜底与错误处理
-
-#### 5.7.1 锁的自动释放
+#### 5.1.1 锁的自动释放
 
 [webdav.go#L97-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/webdav/webdav.go#L97-L189) — `confirmLock`
 
-WebDAV 所有写操作（PUT/DELETE/MKCOL/COPY/MOVE/LOCK/PROPPATCH）在执行前都会通过 `confirmLock` 获取锁，并通过 `defer release()` 保证在函数返回时自动释放：
+WebDAV 所有写操作（PUT/DELETE/MKCOL/COPY/MOVE/LOCK/PROPPATCH）在进入 FileManager 之前，先通过 `confirmLock` 获取 WebDAV 协议级锁，并通过 `defer release()` 保证在函数返回时自动释放：
 
 ```go
 release, ls, status, err := confirmLock(c, fm, user, ancestor, nil, uri, nil)
@@ -452,7 +558,7 @@ defer release()
 - 所有 token 均失败 → 返回 412 Precondition Failed
 - 目标被他人锁定 → 返回 423 Locked
 
-#### 5.7.2 LOCK 失败的自动回滚
+#### 5.1.2 LOCK 失败的自动回滚
 
 [webdav.go#L454-L467](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/webdav/webdav.go#L454-L467)
 
@@ -466,11 +572,11 @@ defer func() {
 }()
 ```
 
-#### 5.7.3 错误码到 HTTP 状态码的映射
+#### 5.1.3 错误码到 HTTP 状态码的映射
 
 [webdav.go#L729-L760](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/webdav/webdav.go#L729-L760) — `purposeStatusCodeFromError`
 
-所有 WebDAV 方法的错误统一通过此函数转换为符合 WebDAV 规范的 HTTP 状态码：
+所有 WebDAV 方法的错误在返回给客户端前，统一通过此函数转换为符合 WebDAV 规范的 HTTP 状态码：
 
 | 错误类型 | HTTP 状态码 |
 |---------|------------|
@@ -483,35 +589,117 @@ defer func() {
 
 同时支持展开 `AggregateError`，递归地取第一个子错误的映射结果。
 
-#### 5.7.4 WebDAV 上传失败的级联兜底
+#### 5.1.4 上传失败的级联兜底
 
-WebDAV PUT 调用 `manager.Update`，而 `Update` 内部在任何一步失败时都会调用 `OnUploadFailed`：
+WebDAV PUT 调用 `manager.Update`，而 `Update` 内部在任何一步失败时都会调用 `OnUploadFailed`。
 
 [manager/upload.go#L349-L364](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/upload.go#L349-L364)
 
+因此 WebDAV PUT 无论在 PrepareUpload / Upload / CompleteUpload 哪一步失败，都会依次触发四层清理：
+1. **WebDAV 层**：`defer release()` 释放协议级锁
+2. **FileManager 层**：`OnUploadFailed` 释放内部文件锁
+3. **FileManager 层**：删除新建的占位文件 / 回滚版本控制
+4. **WebDAV 层**：`purposeStatusCodeFromError` 将错误转成合适的 HTTP 状态码返回
+
+> **分层边界提示**：第 1、4 步在 WebDAV 层（pkg/webdav/），第 2、3 步在 FileManager 层（pkg/filemanager/manager/），两层通过 `m.Update()` 的返回值传递错误，但各自独立管理自己的资源。
+
+### 5.2 FileManager 层兜底
+
+FileManager 层的兜底不区分入口（Web API 还是 WebDAV），对所有入口一视同仁。
+
+#### 5.2.1 策略未找到时的兜底
+
+[manager/fs.go#L92-L117](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/fs.go#L98-L100)
+
 ```go
-if err := m.Upload(ctx, req, uploadSession.Policy, uploadSession); err != nil {
-    m.OnUploadFailed(ctx, uploadSession)   // 锁释放 + 占位文件删除 + 版本回滚
-    return nil, fmt.Errorf("failed to upload new entity: %w", err)
-}
-file, err := m.CompleteUpload(ctx, uploadSession)
-if err != nil {
-    m.OnUploadFailed(ctx, uploadSession)   // 完成阶段失败同样清理
-    return nil, fmt.Errorf("failed to complete update: %w", err)
+if policyID == 0 {
+    policy = &ent.StoragePolicy{Type: types.PolicyTypeLocal, Settings: &types.PolicySetting{}}
 }
 ```
 
-因此 WebDAV PUT 无论在 PrepareUpload / Upload / CompleteUpload 哪一步失败，都会触发：
-1. 释放 WebDAV 层的锁（`defer release()` in handlePut）
-2. 释放 FileManager 内部锁
-3. 删除新建的占位文件 / 回滚版本控制（OnUploadFailed）
-4. 由 purposeStatusCodeFromError 将错误转成合适的 HTTP 状态码返回给客户端
+Entity 没有绑定策略时，默认回退到空本地策略，避免因策略缺失导致整个操作失败。
+
+#### 5.2.2 上传失败时的清理 — OnUploadFailed
+
+[manager/upload.go#L369-L397](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/upload.go#L369-L397)
+
+上传失败后分两种模式处理：
+
+**Master 模式**：
+1. 释放文件锁 (`Unlock`)
+2. 若新建了占位文件 → 删除占位文件
+3. 若为更新已有文件 → 回滚版本控制（删除新版本 Entity）
+
+**Slave 模式**：
+1. 获取驱动并删除已上传的物理文件
+2. 日志记录失败
+
+#### 5.2.3 上传哨兵 — UploadSentinelCheckTask
+
+[manager/upload.go#L447-L499](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/upload.go#L447-L499)
+
+对于不支持合规回调的存储策略（声明了 `HandlerCapabilityUploadSentinelRequired`，如 S3），系统在上传会话创建后同时创建一个延迟执行的哨兵任务：
+
+1. 任务在 `上传会话过期时间 + 5分钟` 后执行
+2. 执行时检查上传会话是否已通过回调完成
+3. 若未完成 → 删除占位 Entity 的物理文件 + 取消上传 Token
+4. 若已完成 → 任务自动标记为 completed
+
+这是对"客户端上传中断、没有回调通知"场景的兜底。
+
+#### 5.2.4 实体回收 — RecycleEntities
+
+[manager/recycle.go#L191-L289](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/recycle.go#L191-L289)
+
+Entity 回收是异步批量执行的，包含以下容错：
+
+1. **按策略分组**：同一策略的 Entity 一起删除，避免频繁切换驱动
+2. **批量分片**：每 100 个 Entity 一批，避免单次请求过大
+3. **部分失败隔离**：使用 `AggregateError` 收集每个 Entity 的独立错误，单个删除失败不影响其他
+4. **force 模式**：强制模式下即使物理文件删除失败，仍从数据库中移除 Entity 记录
+5. **unlink-only 处理**：标记为 `UnlinkOnly` 的 Entity 只解除 DB 记录关联，不删除物理文件
+
+#### 5.2.5 下载 URL 缓存与重试
+
+[manager/entity.go#L260-L303](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/entity.go#L260-L303) — 下载 URL 有 KV 缓存，缓存有效期比 URL 实际过期时间短一个 `EntityUrlCacheMargin`。
+
+[entitysource/entitysource.go#L710-L726](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/manager/entitysource/entitysource.go#L710-L726) — 非本地文件读取时也有 URL 缓存，过期前 1 分钟刷新。
+
+#### 5.2.6 自定义代理 — ApplyProxyIfNeeded
+
+[driver/util.go#L12-L42](file:///d:/fz/0601-2/solo-dogfeeding/code/13-Cloudreve/pkg/filemanager/driver/util.go#L12-L42)
+
+当策略配置了 `CustomProxy = true` 时，下载 URL 会被改写为代理服务器地址，保留原始路径和查询参数。这是一个灵活的中间层代理方案。
+
+### 5.3 存储驱动层兜底
+
+各驱动在自身实现层面有独立的容错机制。
+
+#### 5.3.1 Local 驱动
+
+- **文件不存在检查**：Delete 时用 `util.Exists` 检查，不存在则跳过，不报错
+- **目录自动创建**：Put 时 `prepareFileDirectory` 自动创建缺失的目录层级
+- **预分配失败降级**：`Fallocate` 失败时继续正常写入，仅记录日志
+
+#### 5.3.2 S3 驱动
+
+- **不存在对象静默忽略**：Delete 时 `ErrCodeNoSuchKey` 错误被静默忽略，继续处理其他对象
+- **批量删除自动分批**：超过 1000 个 key 时自动分多批调用 `DeleteObjects`
+- **分片上传重试**：`s3manager.Uploader` 内置分片并发与失败重试
+- **MultipartUpload 自动过期**：S3 侧有生命周期规则，未完成的分片上传会自动清理
+
+#### 5.3.3 Remote 驱动（Master ↔ Slave 间）
+
+- **分片重试**：Master 侧 `uploadChunk` 失败时，通过 `backoff.ConstantBackoff` 指数退避重试，最多重试 `ChunkRetryLimit` 次
+- **上传会话缓存失效兜底**：Slave 侧上传会话过期返回 `CodeUploadSessionExpired`，Master 侧感知后整体失败
+- **删除失败列表回传**：Slave 侧删除失败的文件路径通过响应体回传给 Master，Master 侧 `AggregateError` 汇总
+- **HMAC 签名防篡改**：所有 Master ↔ Slave 通信均带 HMAC 签名，防止请求被篡改
 
 ---
 
 ## 6. 三种核心驱动的 PUT/GET/DELETE 实现对比
 
-以下从实现角度对比 local（本地盘）、s3（S3 兼容）、remote（远程从机 / WebDAV RPC）三种驱动在核心方法上的差异。它们均实现同一 `driver.Handler` 接口。
+以下从实现角度对比 local（本地盘）、s3（S3 兼容）、remote（远程从机 / Master-Slave HTTP RPC）三种驱动在核心方法上的差异。它们均实现同一 `driver.Handler` 接口。
 
 ### 6.1 Put 方法对比
 
@@ -682,3 +870,16 @@ EntitySource.Serve
 | remote.Driver.Delete (远程从机删除) | pkg/filemanager/driver/remote/remote.go | L86-L92 |
 | remote.Driver.Source (远程从机下载 URL) | pkg/filemanager/driver/remote/remote.go | L111-L136 |
 | remote.Driver.Token (远程从机上传凭证) | pkg/filemanager/driver/remote/remote.go | L139-L159 |
+| remote.NewClient (remoteClient 构造) | pkg/filemanager/driver/remote/client.go | L58-L85 |
+| remoteClient.Upload (从机分片上传) | pkg/filemanager/driver/remote/client.go | L95-L139 |
+| **Slave 从机侧** | | |
+| SlaveUpload (从机上传 controller) | routers/controllers/slave.go | L20-L31 |
+| SlaveGetUploadSession (从机创建上传会话) | routers/controllers/slave.go | L33-L43 |
+| SlaveServeEntity (从机下载文件) | routers/controllers/slave.go | L58-L66 |
+| SlaveDelete (从机删除文件) | routers/controllers/slave.go | L93-L101 |
+| SlaveCreateUploadSessionService.Create (从机上传会话服务) | service/explorer/slave.go | L88-L107 |
+| EntityDownloadService.SlaveServe (从机下载服务) | service/explorer/slave.go | L41-L76 |
+| UploadService.SlaveUpload (从机分片上传服务) | service/explorer/upload.go | L135-L154 |
+| local.NewLocalFileEntity (构造本地文件实体) | pkg/filemanager/driver/local/entity.go | L15-L26 |
+| newStatelessFileManager (无状态 FileManager) | pkg/filemanager/manager/manager.go | L173-L184 |
+| NewFileManager (有/无状态分发) | pkg/filemanager/manager/manager.go | L152-L170 |
