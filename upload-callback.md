@@ -944,77 +944,175 @@ callback.POST(
 )
 ```
 
-### 10.4 完整攻击路径推演（又拍云）
+### 10.4 ValidateCallback 内部三失败点精确分析
 
-**前置条件**：攻击者持有一个**未过期的**又拍云策略类型的 `UploadSessionID`（通过任何途径获取，如客户端侧泄漏、日志泄漏等）。
+**源码位置：** [upyun.ValidateCallback](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L356-L384)
+
+```go
+func ValidateCallback(c *gin.Context, session *fs.UploadSession) error {
+    body, err := io.ReadAll(c.Request.Body)
+    c.Request.Body.Close()
+    if err != nil {
+        return fmt.Errorf("failed to read request body: %w", err)  // 失败点0
+    }
+
+    c.Request.Body = io.NopCloser(bytes.NewReader(body))  // ⚠️ 关键副作用：body 被重新塞回请求
+    contentMD5 := c.Request.Header.Get("Content-Md5")
+    date := c.Request.Header.Get("Date")
+    actualSignature := c.Request.Header.Get("Authorization")
+    actualContentMD5 := fmt.Sprintf("%x", md5.Sum(body))
+    if actualContentMD5 != contentMD5 {
+        return errors.New("MD5 mismatch")  // 失败点1
+    }
+
+    signature := sign(session.Policy.AccessKey, session.Policy.SecretKey, []string{
+        "POST", c.Request.URL.Path, date, contentMD5,
+    })
+    if signature != actualSignature {
+        return errors.New("Signature not match")  // 失败点2
+    }
+    return nil
+}
+```
+
+| 失败点 | 触发条件 | 返回错误 | 攻击者能否绕过？ |
+|-------|---------|---------|---------------|
+| **失败点0** | `io.ReadAll` 读取 body 失败（网络异常等极端情况） | `"failed to read request body: %w"` | ❌ 极端场景，正常请求不会触发 |
+| **失败点1 Content-MD5** | `md5(body)` ≠ 请求头 `Content-Md5` | `"MD5 mismatch"` | ✅ **能绕过**：攻击者控制 body，只需用相同 body 计算 MD5 填入 `Content-Md5` 头即可通过 |
+| **失败点2 HMAC签名** | 计算签名 ≠ 请求头 `Authorization` | `"Signature not match"` | ❌ **无法绕过**：签名密钥 = `hex(md5(SecretKey))`，攻击者不知 SecretKey |
+
+**关键推论**：攻击者构造请求时，可以轻易通过失败点1（Content-MD5），但**必然卡在失败点2（HMAC签名）**。然而无论哪个失败点，`ValidateCallback` 返回的 error 都会进入 `UpyunCallbackAuth` 的 `if err != nil` 分支，而该分支不调用 `c.Abort()`，因此**任何失败点的结果都相同——请求继续泄漏进入 ProcessCallback**。
+
+**⚠️ body 重新塞回副作用**：[upyun.go:363](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L363) 的 `c.Request.Body = io.NopCloser(bytes.NewReader(body))` 将已读取的 body 重新塞回请求对象。这意味着后续 handler（ProcessCallback）如果尝试读取 body，仍然能读到完整内容。但 `ProcessCallback` → `manager.CompleteUpload` 链路中**没有任何代码读取请求 body**（它只从 Gin Context 获取 uploadSession），因此此副作用在又拍云场景下不产生实际影响。
+
+### 10.5 请求继续执行后的业务副作用精确清单
+
+请求通过 `UpyunCallbackAuth` 的 `c.Next()` 泄漏进入 `ProcessCallback` 后，以下副作用**全部发生**：
+
+| 步骤 | 代码位置 | 操作 | 副作用 | 是否可逆？ |
+|-----|---------|------|-------|----------|
+| **① 驱动层 CompleteUpload** | [upyun.go:328-330](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L328-L330) | `return nil`（空实现） | 无操作，直接通过 | — |
+| **② ConfirmLock + 释放锁** | [dbfs/upload.go:272-280](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L272-L280) | `ConfirmLock` 验证 LockToken → `release()` 释放文件锁 | 文件锁被释放，其他上传可覆盖此路径 | ❌ 不可逆 |
+| **③ UpgradePlaceholder** | [dbfs/upload.go:309](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L309) | 占位实体升级为 version/file 实体 | 占位文件转为正式文件，出现在用户文件列表 | ❌ 不可逆 |
+| **④ RemoveMetadata** | [dbfs/upload.go:316](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L316) | 删除 `MetadataUploadSessionID` / `ThumbDisabledKey` | 清理上传会话标记 | ❌ 不可逆 |
+| **⑤ UpsertMetadata** | [dbfs/upload.go:322-327](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L322-L327) | 写入会话中的 Metadata | 文件元数据被写入 | ❌ 不可逆 |
+| **⑥ CapEntities** | [dbfs/upload.go:329-333](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/fs/dbfs/upload.go#L329-L333) | 版本保留策略检查 + 限制版本数量 | 可能删除旧版本实体 | ❌ 不可逆 |
+| **⑦ 事务提交** | dbfs/upload.go 事务尾部 | `tx` 提交 | ②-⑥ 全部持久化到 DB | ❌ 不可逆 |
+| **⑧ onNewEntityUploaded** | [manager/upload.go:438-445](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L438-L445) | `mediaMetaForNewEntity` + `fullTextIndexForNewEntity` | 提交媒体元数据提取 + 全文索引后台任务 | ❌ 已排队 |
+| **⑨ KV 删除** | [manager/upload.go:322](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/manager/upload.go#L322) | `m.kv.Delete("callback_", sessionID)` | KV 会话被删除 | ❌ 不可逆 |
+
+**关键结论**：副作用 ②-⑦ 在一个 DB 事务中完成，提交后**不可回滚**。副作用 ⑧ 提交了后台任务。副作用 ⑨ 删除了 KV，意味着**即使攻击者想重放，也无法再通过 UseUploadSession 的 KV 存在性检查**——攻击是"一次性"的，但已经成功。
+
+> **攻击者甚至不需要真正上传任何文件到又拍云存储端。** 文件实体在 DB 中已转正，但物理存储端（又拍云）实际上没有对应文件——这会导致后续访问该文件时出现 404，但文件已占用用户配额并出现在文件列表中。
+
+### 10.6 Gin 响应状态的精确机制
+
+本节精确分析 `UpyunCallbackAuth` 中 `c.JSON(401, ...)` 与 `ProcessCallback` 中 `c.JSON(200, ...)` 的写入顺序与最终响应表现。
+
+#### 10.6.1 Gin responseWriter 的延迟写入机制
+
+Gin 的 `responseWriter` 包装了标准库 `http.ResponseWriter`，采用**延迟写入**策略：
+
+| 方法 | 作用 | 是否立即写入底层？ |
+|------|------|-----------------|
+| `WriteHeader(code)` | 仅设置内部 `w.status = code` | ❌ 不立即写入底层 |
+| `WriteHeaderNow()` | 将 `w.status` 真正写入底层 ResponseWriter | ✅ 立即写入（仅首次有效） |
+| `Write(data)` | 写入响应体 | 首次调用时先触发 `WriteHeaderNow()`，再写入 body |
+| `Written()` | 返回是否已调用过 `WriteHeaderNow()` | — |
+
+`c.JSON(code, obj)` 的调用链：`c.Render(code, JSON{})` → `c.Status(code)` → `w.WriteHeader(code)`（仅设置内部状态）→ `r.Render(w)` → `WriteJSON` → `writeContentType` + `w.Write(jsonBytes)` → `WriteHeaderNow()`（首次写入底层状态码）+ 底层 `Write(body)`。
+
+#### 10.6.2 两次 c.JSON 的执行时序
+
+```
+③ UpyunCallbackAuth 失败分支
+   c.JSON(401, errorResp)
+   ├─ c.Status(401) → w.status = 401（仅设置内部状态，未写入底层）
+   └─ r.Render(w) → w.Write(errorJSON)
+      ├─ WriteHeaderNow() → w.Written() == false → 底层 WriteHeader(401) ✅ 首次写入
+      └─ 底层 Write(errorJSON) → 写入错误 JSON body
+   
+④ ProcessCallback 成功
+   c.JSON(200, successResp)
+   ├─ c.Status(200) → w.WriteHeader(200) → w.Written() == true → ❌ 忽略（status 仍为 401）
+   └─ r.Render(w) → w.Write(successJSON)
+      ├─ WriteHeaderNow() → w.Written() == true → ❌ 跳过（不重复写状态码）
+      └─ 底层 Write(successJSON) → ✅ 追加成功 JSON body 到响应体
+```
+
+#### 10.6.3 最终 HTTP 响应表现
+
+| 响应元素 | 值 | 决定因素 |
+|---------|---|---------|
+| **HTTP 状态码** | **401** | 第一次 `c.JSON(401, ...)` 的 `WriteHeaderNow()` 写入，后续 `WriteHeader(200)` 被忽略 |
+| **响应体** | **两次 JSON 拼接** | 第一次 `Write(errorJSON)` + 第二次 `Write(successJSON)` 都写入了底层 |
+| **Content-Type** | `application/json; charset=utf-8` | 第一次 `writeContentType` 设置，第二次设置时 header 已发送，被忽略 |
+| **Content-Length** | ❌ 未设置 | Gin 的 JSON render 不设置 Content-Length，使用 chunked 或连接关闭界定 |
+
+**精确的响应体内容**（示意）：
+
+```
+HTTP/1.1 401 Unauthorized
+Content-Type: application/json; charset=utf-8
+
+{"error":"Failed to verify callback request."}{"code":0,"msg":"","data":{}}
+```
+
+> **关键结论**：客户端看到的 HTTP 状态码是 **401**（不是 200），响应体是**两次 JSON 拼接**的混合体。但**服务端业务已全部完成**——文件实体已转正、锁已释放、KV 已删除、后台任务已提交。HTTP 401 状态码只是"签名校验失败"的残留标记，**不反映服务端实际状态**。
+>
+> 如果又拍云存储商收到 401，会认为回调失败并重试——但重试时 KV 已被删除（副作用⑨），UseUploadSession 会返回 `CodeUploadSessionExpired`，重试不会产生二次副作用。但如果攻击者在**合法又拍云回调到达之前**抢先发起伪造请求，合法回调反而会被拒（KV 已删），形成"抢注"攻击。
+
+### 10.7 完整攻击路径推演（又拍云）
+
+**前置条件**：攻击者持有一个**未过期的**又拍云策略类型的 `UploadSessionID`（通过客户端侧泄漏、日志泄漏等途径获取）。
 
 ```
 攻击者构造请求
   │
   │ 目标 URL: POST /api/v4/callback/upyun/{有效的 sessionID}/{任意第三段值}
-  │ Headers: 任何值（Content-Md5、Date、Authorization 都可以伪造或乱填）
-  │ Body:    任何内容
+  │ Headers: Content-Md5 = md5(任意body), Date = 任意, Authorization = "UPYUN ak:伪造签名"
+  │ Body:    任意内容（攻击者控制）
   │
   ▼
 ① Gin 路由匹配
-  │ 第三段任意值（如 "x"、"aaaa"）非空且不含 / → ✅ 匹配成功
+  │ 第三段任意值（如 "x"）非空且不含 / → ✅ 匹配成功
   │
   ▼
 ② UseUploadSession(PolicyTypeUpyun)
-  │ sessionID 非空 ✅
-  │ KV["callback_{sessionID}"] 存在 → 会话未过期 ✅
-  │ Policy.Type == "upyun" ✅
+  │ sessionID 非空 ✅ / KV 存在 ✅ / Policy.Type == "upyun" ✅
   │ → 通过，恢复用户上下文
   │
   ▼
 ③ UpyunCallbackAuth（⚠️ 漏洞所在）
   │ upyun.ValidateCallback() 被调用
-  │  ├─ Body MD5 与 Content-Md5 头对比 → 不匹配（攻击者没能力算正确的 MD5）
-  │  └─ 或者 HMAC-SHA1 签名对比 → 不匹配（攻击者没能力算正确的签名）
+  │  ├─ 失败点1 Content-MD5：攻击者用相同 body 计算 MD5 填入 → ✅ 可能通过
+  │  └─ 失败点2 HMAC签名：攻击者不知 SecretKey → ❌ 必然返回 "Signature not match"
   │ err != nil
   │  ├─ l.Error(...) 记录日志
-  │  ├─ c.JSON(401, ...) 写入 401 响应体
+  │  ├─ c.JSON(401, ...) → 写入状态码 401 + 错误 JSON body
   │  ├─ ❌ 没有调用 c.Abort()
   │  └─ ❌ 没有 return
-  │ 函数继续执行
-  │  └─ ✅ 无条件执行 c.Next() → 执行下一个 handler：ProcessCallback
+  │ 函数继续执行 → ✅ 无条件 c.Next() → 进入 ProcessCallback
   │
   ▼
 ④ ProcessCallback → manager.CompleteUpload
-  │
-  ├─ 4a. d.CompleteUpload(ctx, session)  // 驱动层（又拍云）
-  │    [upyun.go:328-330]
-  │    func (handler *Driver) CompleteUpload(...) error { return nil }
-  │    → 空实现，直接 return nil ✅ 通过
-  │
-  ├─ 4b. m.fs.CompleteUpload(ctx, session)  // DBFS 层
-  │    ├─ 获取占位文件 + 实体
-  │    ├─ ConfirmLock → 释放文件锁
-  │    ├─ 实体类型转换：placeholder → version（或正式 file 实体）
-  │    ├─ 版本保留策略检查
-  │    ├─ 更新 Size / Source / LastModified
-  │    └─ 提交文件事务 → ✅ 占位实体转为正式实体，文件"被上传成功"
-  │
-  ├─ 4c. 取消哨兵任务（又拍云没有声明 SentinelRequired，通常 SentinelTaskID=0，跳过）
-  │
-  ├─ 4d. 触发媒体元数据提取 + 全文索引任务
-  │
-  └─ 4e. m.kv.Delete("callback_", sessionID) → 清理 KV，防重放
+  │  ├─ d.CompleteUpload (空实现) → return nil ✅
+  │  ├─ DBFS CompleteUpload → 占位实体转正 + 释放锁 + 事务提交 ✅
+  │  ├─ onNewEntityUploaded → 媒体元数据 + 全文索引任务排队 ✅
+  │  └─ kv.Delete → 清理 KV 会话 ✅
   │
   ▼
-⑤ 返回响应
-  │ ProcessCallback 返回 nil → c.JSON(200, {})
-  │ 注意：虽然 ③ 中写了 401，但 Gin 会以最后一次 c.JSON 写入为准
-  │ 实际上：若 ③ 中 c.JSON(401) 后无其他写入，可能看到 401
-  │        若 ProcessCallback 又 c.JSON(200)，最终响应码是 200
-  │ 无论如何：**服务端的文件实体已经转正成功，上传被确认。**
+⑤ ProcessCallback 返回 nil → c.JSON(200, {})
+  │ → WriteHeader(200) 被忽略（401已写入底层）
+  │ → Write(成功JSON) 追加到响应体
   │
   ▼
-攻击结果：✅ 文件"上传成功"，占用用户配额，出现在用户文件列表中。
-攻击者甚至不需要真正上传任何文件到又拍云存储端。
+最终响应：HTTP 401 + 两次 JSON 拼接的 body
+服务端状态：文件已"上传成功"，出现在用户文件列表，占用配额
+物理存储端：又拍云上无对应文件（攻击者未真正上传）
 ```
 
-### 10.5 漏洞根因分析
+### 10.8 漏洞根因分析
 
 | 缺陷位置 | 缺陷类型 | 后果 |
 |---------|---------|------|
@@ -1022,7 +1120,7 @@ callback.POST(
 | [又拍云 CompleteUpload 空实现](file:///d:/fz/0601-2/solo-dogfeeding/code/14-Cloudreve/pkg/filemanager/driver/upyun/upyun.go#L328-L330) | 合理设计（存储端已完成，不需要再次校验） | 单独存在时没问题，但与上一条 Bug 组合后形成高危组合拳 |
 | 缺少独立业务 size 校验层 | 设计缺口（OSS 有 OSSCallbackValidate，七牛和又拍云没有） | 如果存在独立 size 校验层且其有正确 c.Abort()，即使上两条都存在也能被兜住 |
 
-### 10.6 与 OBS 漏洞的对比
+### 10.9 与 OBS 漏洞的对比
 
 | 维度 | 又拍云 | OBS |
 |-----|-------|-----|
@@ -1030,13 +1128,16 @@ callback.POST(
 | **知 SessionID 能否冒用** | ✅ 能 | ✅ 能 |
 | **是否需要正确 AK/SK 参与计算** | ❌ 不需要（签名失败不中断） | ❌ 不需要（无签名层） |
 | **是否需要上传文件到存储端** | ❌ 不需要 | ❌ 不需要 |
-| **攻击成功后响应中能否看到 200** | 取决于 Gin 响应写入顺序，但服务端已生效 | 直接 200 |
+| **攻击成功后 HTTP 响应码** | **401**（第一次 c.JSON 决定） | **200**（ProcessCallback 成功） |
+| **攻击成功后响应体** | 两次 JSON 拼接（错误+成功） | 正常成功 JSON |
+| **是否可重放** | ❌ 不可（KV 已删） | ❌ 不可（KV 已删） |
+| **是否可抢注合法回调** | ✅ 可（抢先触发 → KV 删除 → 合法回调失败） | ✅ 可 |
 | **安全评级** | **D（高危）** | **C（高风险）** |
-| **修复难度** | 一行代码（加 c.Abort() + return） | 需要实现 Head Object 调用 |
+| **修复难度** | 两行代码（加 c.Abort() + return） | 需要实现 Head Object 调用 |
 
-> 又拍云评级比 OBS 更低，是因为它**看起来有签名层的保护**——开发者会误以为"有签名就安全了"——但实际上形同虚设，这是一种更具迷惑性的漏洞。
+> 又拍云评级比 OBS 更低，是因为它**看起来有签名层的保护**——开发者会误以为"有签名就安全了"——但实际上形同虚设，这是一种更具迷惑性的漏洞。此外又拍云攻击后返回 401（而非 200），可能让攻击者误以为攻击失败，但实际上服务端业务已完成——这种"响应码欺骗性"增加了漏洞的隐蔽性。
 
-### 10.7 修复方案（代码级）
+### 10.10 修复方案（代码级）
 
 ```diff
 // routers/controllers/callback.go:79-90 —— UpyunCallbackAuth
