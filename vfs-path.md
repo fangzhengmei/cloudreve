@@ -541,7 +541,6 @@ Phase: CompleteUpload → completeUpload()
 
 | 调用场景 | 节点角色 | manager 类型 | 选项 | 走哪条分支 |
 |---------|---------|------------|------|-----------|
-| 客户端分片最后一片 | 主/从 | stateful | 无 | `Update()` stateful |
 | 归档产物上传 | master | stateful | 无 | `Update()` stateful |
 | 归档产物上传 | slave | stateless | `WithNode`+`WithStatelessUserID`+`WithNoEntityType` | `updateStateless()` |
 | 解压文件上传 | master | stateful | `WithNoEntityType` | `Update()` stateful |
@@ -551,6 +550,8 @@ Phase: CompleteUpload → completeUpload()
 
 > 同一个 `fm.Update()` 调用，在主节点（stateful manager）走三段本地调用（PrepareUpload → Upload → CompleteUpload），在从节点（stateless manager）走三段 RPC（PrepareUpload RPC → 本地 Put → CompleteUpload RPC）。分支选择不取决于调用方传了什么选项，而取决于 **manager 实例本身的 `stateless` 标志**——选项（`WithNode`/`WithStatelessUserID`）只是为 RPC 提供必要参数。
 
+> **注意：客户端分片上传不在此表**——客户端上传确认走 `m.Upload()`（[UploadManagement 接口](pkg/filemanager/manager/upload.go#L188-L221)）+ `m.CompleteUpload()`（[upload.go#L289-L324](pkg/filemanager/manager/upload.go#L289-L324)），分片组合直接驱动 `d.Put()` / `d.CompleteUpload()`，**不经过 `fm.Update()`（[FileOperation 接口](pkg/filemanager/manager/upload.go#L326-L367)）编排的三段式**。本表仅汇总服务端任务（归档/解压/远程下载）的 `fm.Update()` 分支。
+
 ### 4.6 无状态搬运与客户端上传确认的对比
 
 仓库中存在三种"数据入库"链路，它们的触发方、凭证模型、Session 管理、失败回滚方式各有不同。此前文档将"无状态搬运"与"客户端上传确认"混为一谈，下表逐项校准：
@@ -558,24 +559,287 @@ Phase: CompleteUpload → completeUpload()
 | 维度 | 客户端上传确认 | 无状态搬运（stateless） | 有状态服务端上传（stateful） |
 |------|-------------|-------------------|---------------------|
 | **触发方** | 外部客户端（HTTP API） | 从节点任务（SlaveUploadTask / SlaveExtractArchiveTask） | 主节点任务（archive / extract / remote_download on master） |
-| **入口方法** | `CreateUploadSessionService.Create` → `m.CreateUploadSession` | `fm.Update(WithStatelessUserID, WithNode)` | `fm.Update()`（无 stateless 选项） |
-| **manager 类型** | stateful（`NewFileManager(dep, user)`） | stateless（`NewFileManager(dep, nil)`） | stateful（`NewFileManager(dep, user)`） |
+| **入口方法** | 会话创建：`CreateUploadSessionService.Create` → `m.CreateUploadSession`；分片写入：`UploadService.LocalUpload` → `m.Upload()`（每片，[upload.go#L188](service/explorer/upload.go#L188)）；最后一片：`m.CompleteUpload()`（[upload.go#L202](service/explorer/upload.go#L202)） | `fm.Update(WithStatelessUserID, WithNode)` → 内部调 `updateStateless()` | `fm.Update()`（无 stateless 选项） |
+| **manager 类型** | 主节点：stateful（`NewFileManager(dep, user)`）；从节点分片接收 `SlaveUpload`：stateless（`NewFileManager(dep, nil)`，[service/explorer/upload.go#L150](service/explorer/upload.go#L150)） | stateless（`NewFileManager(dep, nil)`） | stateful（`NewFileManager(dep, user)`） |
 | **凭证生成** | 生成 `UploadCredential`（S3 presigned URL / OSS token），返回给客户端 | 无外部凭证，从节点直接 driver.Put | 无外部凭证，主节点直接 driver.Put |
 | **Session 缓存** | KV（`UploadSessionCachePrefix`，TTL = UploadSessionTTL）+ 可选哨兵任务 | RPC 响应内存传递，**不入 KV** | 进程内传递，**不入 KV** |
 | **分片确认** | `ConfirmUploadSession()` 校验分片偏移、锁令牌、策略中转约束 | 无分片（整文件 Put） | 无分片（整文件 Put） |
 | **中转约束** | `ConfirmUploadSession`：非本地 + 非中转 → `CodePolicyNotAllowed`（[upload.go#L168-L170](pkg/filemanager/manager/upload.go#L168-L170)） | 无此约束（从节点本地 Put，不经客户端中转） | 无此约束（主节点本地 Put） |
-| **物理写入** | 客户端直传存储（非中转）或 Cloudreve relay Put | 从节点 `CastStoragePolicyOnSlave` 后 driver.Put | 主节点 driver.Put |
-| **完成入库** | `CompleteUpload`：driver.CompleteUpload + DBFS.CompleteUpload | RPC `CompleteUpload` → 主节点 DBFS.CompleteUpload | 本地 `CompleteUpload`：driver.CompleteUpload + DBFS.CompleteUpload |
+| **物理写入** | 非中转：客户端直传存储驱动（Cloudreve 不调 `d.Put`）；中转：`m.Upload()` 每片调 `d.Put()`（[upload.go#L188](service/explorer/upload.go#L188)），主→从经 remote driver 转发到从节点 `SlaveUpload` | 从节点 `CastStoragePolicyOnSlave` 后 `m.Upload()` → `d.Put()`（整文件） | 主节点 `m.Upload()` → `d.Put()`（整文件） |
+| **完成入库** | 主节点 `m.CompleteUpload()`：`d.CompleteUpload()` + `m.fs.CompleteUpload()`（占位升级+版本裁剪）；从节点 stateless manager 的 `m.fs` 为 nil，**仅做 `d.CompleteUpload()`，跳过 DBFS**（[upload.go#L303-L307](pkg/filemanager/manager/upload.go#L303-L307) `if m.fs != nil`） | RPC `CompleteUpload` → 主节点 `StatelessCompleteUpload()` → `fm.CompleteUpload()`（DBFS 完成） | 本地 `CompleteUpload`：`d.CompleteUpload()` + `m.fs.CompleteUpload()` |
 | **哨兵清理** | `UploadSentinelCheckTask`（COS/S3 超时兜底，[upload.go#L501-L548](pkg/filemanager/manager/upload.go#L501-L548)） | **无**（无外部客户端超时风险） | **无** |
 | **失败回滚** | `OnUploadFailed`：释放锁 / 删占位文件 / 版本回滚 | RPC `OnUploadFailed` → 主节点回滚 + 从节点 driver.Delete | `OnUploadFailed`：释放锁 / 删占位文件 / 版本回滚 |
 | **返回值** | `fs.File`（返回给客户端） | `nil, nil`（从节点不需要 File 对象） | `fs.File` |
-| **后续任务** | `onNewEntityUploaded`：媒体元数据 + 全文索引 | **跳过**（[upload.go#L439](pkg/filemanager/manager/upload.go#L439) `if !m.stateless`） | `onNewEntityUploaded`：媒体元数据 + 全文索引 |
+| **后续任务** | 主节点 `onNewEntityUploaded`：媒体元数据 + 全文索引；从节点 stateless 跳过（[upload.go#L439](pkg/filemanager/manager/upload.go#L439)） | **跳过**（[upload.go#L439](pkg/filemanager/manager/upload.go#L439) `if !m.stateless`） | `onNewEntityUploaded`：媒体元数据 + 全文索引 |
 
 > **核心差异总结**：
-> 1. **客户端上传确认**是"先发凭证、客户端自行上传、再回调确认"的异步两段式（CreateUploadSession → 客户端传 → CompleteUpload），需要 KV 缓存 Session 和哨兵兜底超时；
-> 2. **无状态搬运**是"从节点本地读文件 → RPC 到主节点建占位 → 本地 Put → RPC 完成入库"的同步三段式，Session 不入 KV、无哨兵、无客户端凭证，但**主节点仍完整执行能力校验与所有权检查**（见 4.4 节权限叠加说明）；
+> 1. **客户端上传确认**是"先发凭证、客户端自行上传、再回调确认"的异步两段式（CreateUploadSession → 客户端传 → CompleteUpload），需要 KV 缓存 Session 和哨兵兜底超时；分片写入走 `m.Upload()`（UploadManagement 接口），**不经过 `fm.Update()`**。
+> 2. **无状态搬运**是"从节点本地读文件 → RPC 到主节点建占位 → 本地 Put → RPC 完成入库"的同步三段式，Session 不入 KV、无哨兵、无客户端凭证，但**主节点仍完整执行能力校验与所有权检查**（见 4.4 节权限叠加说明）；DBFS 完成通过显式 RPC（`o.Node.CompleteUpload`）触发。
 > 3. **有状态服务端上传**是无状态搬运的"本地版"——同样的三段式但全部在主节点进程内完成，返回 File 对象并触发后续媒体/索引任务。
-> 4. 三者的 DB 层实体入库逻辑（占位创建 → 升级提交 → 版本裁剪 → StorageDiff）完全一致，差异仅在于**物理写入由谁执行**（客户端 / 从节点 / 主节点）和**DB 操作经由什么通道**（HTTP 回调 / RPC / 本地调用）。
+> 4. **关键区分：`m.Upload()` vs `m.Update()`**——`m.Upload()`（[UploadManagement 接口](pkg/filemanager/manager/upload.go#L188-L221)）仅做物理写入 `d.Put()`，是三种链路共用的底层原语；`m.Update()`（[FileOperation 接口](pkg/filemanager/manager/upload.go#L326-L367)）编排完整三段式（PrepareUpload → Upload → CompleteUpload），仅服务端任务（归档/解压/远程下载）调用。客户端上传确认走的是 `m.Upload()` + `m.CompleteUpload()` 分片组合，不走 `m.Update()`。
+> 5. 三者的 DB 层实体入库逻辑（占位创建 → 升级提交 → 版本裁剪 → StorageDiff）完全一致，差异仅在于**物理写入由谁执行**（客户端 / 从节点 / 主节点）和**DB 操作经由什么通道**（HTTP 回调 / RPC / 本地调用）。但客户端上传在从节点（stateless）的 `CompleteUpload` **不做 DBFS 完成**（`m.fs` 为 nil），DBFS 完成始终在主节点执行。
+
+#### 4.6.1 客户端上传确认：四种场景的完整责任链路
+
+"客户端上传确认"并非单一链路——根据存储策略的**节点归属**（主/从）和**中转设置**（Relay=true/false），实际分为四种场景，各节点的责任截然不同：
+
+##### 场景 A：主节点本地策略（Local policy）
+
+```
+客户端 ←→ 主节点（同时负责物理写入 + DBFS）
+
+[主节点 CreateUploadSession] → m.fs.PrepareUpload() 建占位 + KV 存 Session + 可选哨兵任务
+      │
+      ├─► 非中转：d.Token() 生成凭证 → 客户端直传存储（S3/COS 等）→ 云厂商 HTTP 回调到主节点
+      │     ProcessCallback(c) → m.CompleteUpload() → d.CompleteUpload() + m.fs.CompleteUpload()
+      │
+      └─► 中转：不生成凭证，客户端分片 POST 到主节点 FileUpload 接口
+            LocalUpload → ConfirmUploadSession → processChunkUpload
+                  ├─► 每片：m.Upload() → Local driver.Put()
+                  └─► 最后一片：m.CompleteUpload() → m.fs.CompleteUpload() + onNewEntityUploaded
+```
+
+**责任分配**：
+| 责任 | 承担方 | 代码位置 |
+|------|--------|---------|
+| 占位创建 | 主节点 stateful manager | [upload.go#L81](pkg/filemanager/manager/upload.go#L81) |
+| 物理写入 | 非中转=客户端/云厂商；中转=主节点 Local driver | [upload.go#L98](pkg/filemanager/manager/upload.go#L98) vs [L188](pkg/filemanager/manager/upload.go#L188) |
+| DBFS 完成入库 | 主节点 stateful manager | 回调 [callback/upload.go#L54](service/callback/upload.go#L54) 或 本地 [upload.go#L304](pkg/filemanager/manager/upload.go#L304) |
+| 媒体元数据 + 全文索引 | 主节点 `onNewEntityUploaded` | [upload.go#L438-L444](pkg/filemanager/manager/upload.go#L438-L444) |
+| 失败回滚 | 主节点 `OnUploadFailed` 解锁+删占位+版本回滚 | [upload.go#L371-L386](pkg/filemanager/manager/upload.go#L371-L386) |
+
+##### 场景 B：从节点 Remote 策略（非中转 Relay=false）
+
+**这是最容易混淆的场景**——存在**两个同 ID 的 Session** 分别存活于主/从节点的 KV 中，DBFS 完成通过从节点 Local driver 的 **HMAC 回调** 触发：
+
+```
+[主节点 CreateUploadSession]
+   ├─► m.fs.PrepareUpload() 建占位
+   ├─► 主节点 KV 存 Session（ID=XYZ）
+   └─► Remote driver.Token()  [remote.go#L139-L158]
+         ├─► 设置 session.Callback = 主节点回调 URL（PolicyTypeRemote）
+         ├─► uploadClient.CreateUploadSession() → HTTP PUT 到从节点 SlaveGetUploadSession
+         │      从节点 [slave.go#L88-L107]：
+         │        NewFileManager(dep, nil) → stateless
+         │        m.CreateUploadSession(WithUploadSession(&service.Session)) // 复用主节点传来的 Session（含 Callback URL）
+         │        从节点 KV 存 Session（ID=XYZ，与主节点同 ID）
+         └─► 返回上传凭证（指向从节点 SlaveUpload 端点的签名 URL）
+
+客户端分片 POST 到从节点 /upload/:sessionId  → SlaveUpload [service/explorer/upload.go#L135-L154]
+      │
+      ├─► 从节点 KV 取 Session（ID=XYZ）
+      ├─► stateless manager = NewFileManager(dep, nil)
+      └─► processChunkUpload
+            ├─► 每片：m.Upload() → CastStoragePolicyOnSlave(Remote→Local) → Local driver.Put()
+            └─► 最后一片：m.CompleteUpload() [upload.go#L289-L324]
+                  ├─► GetStorageDriver(Local)
+                  ├─► d.CompleteUpload(session) ← **关键触发点！**
+                  │      Local driver [local.go#L255-L294] 看到 session.Callback != ""
+                  │      → 发送 HTTP POST（HMAC 签名，SlaveKey 加密）到主节点回调 URL
+                  │
+                  ├─► [主节点侧] 回调路由 /callback/remote/:sessionID/:key
+                  │      middleware.UseUploadSession → 从**主节点自己的 KV** 取 Session（ID=XYZ）
+                  │      ProcessCallback [service/callback/upload.go#L45-L59]
+                  │        NewFileManager(dep, user) → stateful（带 user！）
+                  │        m.CompleteUpload(c, uploadSession)
+                  │          ├─► d.CompleteUpload → Remote driver = no-op [remote.go#L166-L168]
+                  │          ├─► m.fs.CompleteUpload → **占位升级+版本裁剪+事务提交！**
+                  │          ├─► m.onNewEntityUploaded → 媒体元数据 + 全文索引
+                  │          └─► 主节点 KV 删除 Session（ID=XYZ）
+                  │      返回 200 OK 给从节点
+                  │
+                  ├─► [回到从节点侧] 回调成功
+                  ├─► m.fs == nil → 跳过 DBFS（从节点 stateless 无 fs）
+                  └─► 从节点 KV 删除 Session（ID=XYZ）
+```
+
+**责任分配（非中转 Remote 策略）**：
+| 责任 | 承担方 | 触发方式 | 代码位置 |
+|------|--------|---------|---------|
+| 占位创建 | **主节点** | stateful PrepareUpload | [upload.go#L81](pkg/filemanager/manager/upload.go#L81) |
+| Session 入 KV | **主 + 从** 各存一份（同 ID） | 双方各调 kv.Set | [upload.go#L136-L140](pkg/filemanager/manager/upload.go#L136-L140) × 2 |
+| 物理写入分片 | **从节点** | 客户端直传 SlaveUpload | [upload.go#L188](pkg/filemanager/manager/upload.go#L188) |
+| DBFS 完成入库 | **主节点** | 从节点 Local driver HMAC 回调触发 | [local.go#L255-L294](pkg/filemanager/driver/local/local.go#L255-L294) → [callback/upload.go#L54](service/callback/upload.go#L54) |
+| 媒体元数据 + 全文索引 | **主节点** | 回调内 onNewEntityUploaded | [upload.go#L438-L444](pkg/filemanager/manager/upload.go#L438-L444) |
+| 失败-主节点清理 | **主节点** | 哨兵任务兜底（超时未回调） | [upload.go#L447-L548](pkg/filemanager/manager/upload.go#L447-L548) |
+| 失败-从节点清理 | **从节点** | processChunkUpload 出错 → OnUploadFailed → Local driver.Delete | [upload.go#L387-L395](pkg/filemanager/manager/upload.go#L387-L395) |
+| 失败-回调失败 | **从节点** | d.CompleteUpload 返回错误 → 整个 CompleteUpload 失败 | [local.go#L279-L291](pkg/filemanager/driver/local/local.go#L279-L291) |
+
+##### 场景 C：从节点 Remote 策略（中转 Relay=true）
+
+中转模式下**无回调机制**——主节点作为代理亲自将数据搬运到从节点，并在本地完成所有 DBFS：
+
+```
+[主节点 CreateUploadSession]
+   ├─► Relay=true → unrelayed = false
+   ├─► 跳过 d.Token()，不生成客户端凭证
+   └─► 主节点 KV 存 Session
+
+客户端分片 POST 到主节点 FileUpload → LocalUpload → processChunkUpload
+      ├─► 每片：m.Upload() → d.Put(Remote driver)
+      │              Remote driver.Put [remote.go#L78-L82] → remoteClient.Upload [client.go#L95-L132]
+      │                ├─► 从节点创建 **内部临时 Session**（新 ID，无 Callback URL！）
+      │                ├─► 分片传输到从节点 SlaveUpload
+      │                │      从节点 processChunkUpload → 最后一片 → m.CompleteUpload
+      │                │            ├─► d.CompleteUpload：session.Callback == "" → **无回调！直接返回**
+      │                │            └─► m.fs == nil → 跳过 DBFS（本来就不需要，因为是内部临时 Session）
+      │                └─► 全部分片成功后 remoteClient.Upload 返回
+      └─► 最后一片：m.CompleteUpload()  **在主节点本地执行！**
+                  ├─► d.CompleteUpload(Remote) = no-op
+                  ├─► m.fs.CompleteUpload → **占位升级+版本裁剪+事务提交**
+                  ├─► m.onNewEntityUploaded → 媒体 + 索引
+                  └─► 主节点 KV 删除 Session
+```
+
+**责任分配（中转 Remote 策略）**：
+| 责任 | 承担方 | 关键区别 |
+|------|--------|---------|
+| 占位创建 | 主节点 | 仅主节点 Session，从节点临时 Session 无占位 |
+| 物理写入 | 主节点转发 → 从节点 | 从节点有**两个** Session：内部临时（无 Callback）+ 不存在（因为主节点做 DBFS） |
+| DBFS 完成入库 | 主节点 | **本地调用**，无需回调 |
+| 媒体元数据 + 全文索引 | 主节点 | 本地 onNewEntityUploaded |
+
+##### 场景 D：云存储直传（S3/COS/OSS/Obs/Upyun/OneDrive）
+
+与场景 B 结构类似，但"回调"由**第三方云存储厂商**发起：
+
+```
+[主节点 CreateUploadSession]
+   ├─► S3/COS/OSS driver.Token → 生成 presigned multipart URL
+   │      同时在 multipart 初始化参数中设置 Callback = 主节点 /callback/s3|cos|oss/:sessionID
+   │      [s3.go#L342-L345] / [oss.go#L497-L504]
+   └─► 返回凭证给客户端
+
+客户端 → 按 presigned URL 直传云存储分片
+      → 所有分片完成，云存储完成 multipart 合并
+      → 云存储**主动 HTTP POST 回调**到主节点设置的 Callback URL
+
+[主节点回调路由] /callback/{policy_type}/:sessionID/:key
+      middleware.UseUploadSession → 从 KV 取 Session
+      各策略特有的签名校验（OSS CallbackValidate、QiniuCallbackValidate、UpyunCallbackAuth 等）
+      ProcessCallback → m.CompleteUpload → DBFS 完成 + 媒体/索引 + KV 删除
+```
+
+---
+
+#### 4.6.2 无状态搬运（updateStateless）：完整责任链路
+
+与客户端上传确认的"回调驱动"不同，无状态搬运完全由**显式 RPC** 驱动，Session 从**不入 KV**，从始至终只做物理搬运：
+
+```
+从节点 updateStateless(ctx, req, o) [upload.go#L400-L436]
+   │
+   ├─► A. PrepareUpload 阶段 → 显式 RPC 到主节点
+   │      o.Node.PrepareUpload(StatelessPrepareUploadService{UploadRequest, UserID})
+   │      → 主节点 [rpc.go#L46-L64]：
+   │          通过 UserID 取 LoginUser，注入 UserCtx
+   │          fm = NewFileManager(dep, user) → stateful（带 user！）
+   │          fm.PrepareUpload → DBFS.PrepareUpload
+   │              ├─► getPreferredPolicy() 选策略（用户组→策略）
+   │              ├─► 能力校验：getNavigator + UploadFile+LockFile 子集判定
+   │              ├─► 所有权检查
+   │              ├─► generateSavePath() 生成物理路径
+   │              └─► 创建占位 File + Entity（UploadSessionID、LockToken）
+   │          返回 UploadSession{Policy, FileID, EntityID, LockToken, ...}
+   │      **重要：这个 Session 是 RPC 响应，主/从双方都不 kv.Set()！**
+   │
+   ├─► B. Upload 阶段 → 从节点本地落盘
+   │      m = stateless manager（m.fs == nil，m.stateless == true）
+   │      m.Upload(ctx, req, CastStoragePolicyOnSlave(policy), session) [upload.go#L188-L221]
+   │          ├─► GetStorageDriver → Local driver（CastStoragePolicyOnSlave 把 Remote 翻成 Local）
+   │          ├─► 可选加密包装 cryptor
+   │          └─► d.Put(ctx, req) → 整文件落盘（无分片！）
+   │      失败：o.Node.OnUploadFailed RPC → 主节点解锁+删占位/回滚版本，从节点 driver.Delete
+   │
+   └─► C. CompleteUpload 阶段 → 显式 RPC 到主节点
+          o.Node.CompleteUpload(StatelessCompleteUploadService{Session, UserID})
+          → 主节点 [rpc.go#L70-L81]：
+              通过 UserID 取 LoginUser，注入 UserCtx
+              fm = NewFileManager(dep, user) → stateful
+              fm.CompleteUpload(ctx, s.UploadSession) [upload.go#L289-L324]
+                  ├─► d.CompleteUpload → driver 特定（Local=空，S3=合并分片等）
+                  ├─► m.fs != nil → m.fs.CompleteUpload → **占位升级+版本裁剪+事务提交！**
+                  ├─► session.SentinelTaskID → 取消哨兵（如有）
+                  ├─► m.onNewEntityUploaded → **媒体元数据 + 全文索引**
+                  │     （此处 !m.stateless = true → **会执行！** 与客户端上传从节点场景不同）
+                  └─► _ = m.kv.Delete → 尝试删除 KV 但 Session 从未存入过 → 空操作 no-op
+          返回 fs.File 给从节点 → 但从节点 updateStateless 直接 return nil, nil 丢弃
+
+      ✓ 完成：从节点物理文件存在 + 主节点 DB 实体升级提交
+```
+
+**责任分配（无状态搬运）**：
+| 责任 | 承担方 | 触发方式 | 代码位置 |
+|------|--------|---------|---------|
+| 占位创建 | 主节点 | `o.Node.PrepareUpload` 显式 RPC | [rpc.go#L46-L64](service/node/rpc.go#L46-L64) |
+| Session 存储 | **不存** | RPC 内存传递，不入 KV | 对比 [upload.go#L136](pkg/filemanager/manager/upload.go#L136) 未被调用 |
+| 能力校验+所有权检查 | 主节点 | RPC 内 stateful manager 执行 | [rpc.go#L55-L56](service/node/rpc.go#L55-L56) |
+| 物理写入 | 从节点 | `m.Upload()` → Local driver.Put（整文件无分片） | [upload.go#L188](pkg/filemanager/manager/upload.go#L188) |
+| DBFS 完成入库 | 主节点 | `o.Node.CompleteUpload` 显式 RPC | [rpc.go#L70-L80](service/node/rpc.go#L70-L80) |
+| 媒体元数据 + 全文索引 | 主节点 | RPC 内 stateful onNewEntityUploaded | [upload.go#L438-L444](pkg/filemanager/manager/upload.go#L438-L444) |
+| 失败-主节点清理 | 主节点 | `o.Node.OnUploadFailed` 显式 RPC | [rpc.go#L87-L98](service/node/rpc.go#L87-L98) |
+| 失败-从节点清理 | 从节点 | updateStateless 内 OnUploadFailed → driver.Delete | [upload.go#L412-L417](pkg/filemanager/manager/upload.go#L412-L417) |
+| 哨兵超时兜底 | **无** | 无外部客户端参与 → 无需 | 对比 [upload.go#L121-L134](pkg/filemanager/manager/upload.go#L121-L134) |
+
+---
+
+#### 4.6.3 关键责任差异：逐项对比
+
+上述分析揭示了几个此前文档未充分说明的核心差异：
+
+| 对比维度 | 客户端上传确认（非中转 Remote） | 客户端上传确认（中转 Remote） | 无状态搬运（stateless） |
+|---------|-------------------------------|-----------------------------|----------------------|
+| **Session 数量与位置** | 主+从 KV 各一份，**同 ID** | 仅主节点 KV（从节点内部临时 Session 独立 ID） | **不入 KV**，RPC 内存传递 |
+| **主从通信方向** | 从→主（**回调驱动**，Local driver HMAC POST） | 无回调，主→从单向推数据 | 从→主（**RPC 驱动**，3 次显式调用） |
+| **触发 DBFS 完成的信号** | 从节点 CompleteUpload 中 **Local driver 发现 Callback URL 非空** 时发起 HMAC 回调 | 主节点 processChunkUpload 最后一片 **本地 CompleteUpload 调用** | 从节点 updateStateless 中 **显式 `o.Node.CompleteUpload` RPC** |
+| **从节点 CompleteUpload 中的 m.fs** | nil（stateless），DBFS 跳过 | 不涉及（中转场景 CompleteUpload 在主节点执行） | nil（stateless），DBFS 跳过 |
+| **DBFS 执行的 manager 类型** | 主节点 stateful（回调内 NewFileManager(dep, user)） | 主节点 stateful（LocalUpload 原 manager） | 主节点 stateful（RPC 内 NewFileManager(dep, user)） |
+| **物理写入是否分片** | 是，由客户端分片，从节点逐片接收 | 是，客户端→主节点→从节点 双层分片 | **否**，整文件 Put |
+| **onNewEntityUploaded 执行方** | 主节点（回调内 stateful manager） | 主节点（本地 CompleteUpload 内） | 主节点（RPC 内 stateful manager） |
+| **从节点 onNewEntityUploaded** | 跳过（m.stateless=true） | 跳过（从节点临时 Session 的 CompleteUpload 不涉及） | 跳过（m.stateless=true） |
+| **凭证与权限模型** | 主→从：上传 URL HMAC 签名；从→主：回调 SlaveKey HMAC | 主→从：Remote client 的 SlaveKey HMAC | 全程 Node RPC，SlaveKey HMAC |
+| **占位实体与文件大小** | 主节点 PrepareUpload 根据客户端请求 Props 建占位 | 同左 | 主节点 PrepareUpload 根据从节点 UploadRequest Props 建占位 |
+| **回调机制类型** | Local driver.CompleteUpload 主动 HTTP POST（Cloudreve 内部机制） | **无回调** | **无回调**，显式 RPC 三段式 |
+| **哨兵任务** | 主节点创建 UploadSentinelCheckTask（超时未收到回调时清理） | 主节点可选创建 | **无** |
+
+---
+
+#### 4.6.4 常见混淆点澄清
+
+**混淆点 1：从节点的两种"CompleteUpload"路径**
+
+从节点上存在两种完全不同的 CompleteUpload 调用，不可混淆：
+
+| 场景 | 调用位置 | 触发方 | Session 中的 Callback | DBFS 完成地点 |
+|------|---------|--------|---------------------|-------------|
+| 接收客户端分片（非中转 Remote） | [service/explorer/upload.go#L202](service/explorer/upload.go#L202) processChunkUpload 最后一片 | 外部客户端 HTTP 请求 | **非空**（指向主节点回调 URL）→ Local driver HMAC POST 回调到主节点 | 主节点（回调内） |
+| 执行无状态搬运 updateStateless | [pkg/filemanager/manager/upload.go#L421](pkg/filemanager/manager/upload.go#L421) 显式 RPC | 从节点内部任务代码 | Session 无 Callback 字段概念 | 主节点（RPC 内） |
+
+**混淆点 2：回调机制的三种不同触发者**
+
+客户端上传确认链路中的"回调"并非统一机制：
+
+1. **云存储厂商发起**（S3/COS/OSS/OD）：厂商完成 multipart 后按初始化时设置的 Callback URL 发起 HTTP POST
+2. **从节点 Local driver 发起**（非中转 Remote 策略）：`CompleteUpload` 中检测到 `session.Callback != ""` [local.go#L256](pkg/filemanager/driver/local/local.go#L256)，主动用 SlaveKey HMAC 签名 POST 到主节点
+3. **客户端主动确认**（中转/本地策略）：客户端发送最后一片后，主节点在 `processChunkUpload` 内直接调用 `m.CompleteUpload()`，不涉及网络回调
+
+而**无状态搬运不使用任何回调机制**——全部通过从节点主动发起的 `o.Node.XXX` 显式 RPC 三段式完成。
+
+**混淆点 3：中转模式下从节点的"幽灵 CompleteUpload"**
+
+中转模式下，从节点确实会在接收完主节点转发的分片后执行 CompleteUpload（内部临时 Session 的），但这个 CompleteUpload：
+- Session 的 Callback 为空 → 不会回调主节点
+- manager 是 stateless → 不会做 DBFS
+- 本质上只是"从节点本地物理写入完成确认"，不产生任何持久化副作用
+- 真正的 DBFS 完成在**主节点侧** processChunkUpload 的最后一片内完成
+
+**混淆点 4：stateless manager 含义的双重语境**
+
+"stateless" 这个词在两条链路中含义不同：
+- **客户端上传确认（SlaveUpload）**：manager 是 stateless，指它没有 `m.fs`、无法做 DBFS，但 Session 是从 KV 里取出来的**有状态**对象
+- **无状态搬运（updateStateless）**：manager 是 stateless，整个链路 Session 从不入 KV，完全**无状态**，所有状态通过 RPC 参数显式传递
+
+---
 
 ### 4.7 失败回滚与清理
 
@@ -678,3 +942,5 @@ Phase: CompleteUpload → completeUpload()
 7. **三种上传链路不可混用**：客户端上传确认（`CreateUploadSession` + `ConfirmUploadSession` + `CompleteUpload`）、无状态搬运（`updateStateless`）、有状态服务端上传（stateful `Update`）是三条独立链路（详见 4.6 节）。客户端上传确认有 KV 缓存、凭证生成、哨兵兜底；后两者无 KV、无凭证、无哨兵。二次开发若需在服务端搬运文件，应通过 `fm.Update()` 走 stateful 或 stateless 分支（由 `NewFileManager` 的 user 参数决定），**不要**混用 `CreateUploadSession`（那会生成客户端凭证并入 KV，服务端任务无法消费）。
 
 8. **归档从节点路径的 completeUpload 是空操作**：`CreateArchiveTask` 在从节点路径下，压缩和上传均委托给从节点的 Slave 任务完成，主节点的 `completeUpload()` 阶段仅返回 `StatusCompleted` 不做任何 DB 操作——因为从节点的无状态上传已通过 RPC 在主节点完成了实体入库。二次开发若扩展归档任务，不应在 `completeUpload` 阶段重复执行实体入库逻辑。
+
+9. **`m.Upload()` 与 `m.Update()` 接口区分**：二者属于不同接口，不可混淆。`m.Upload()` 属 [UploadManagement 接口](pkg/filemanager/manager/upload.go#L188-L221)，仅做物理写入 `d.Put(ctx, req)`，不创建占位、不完成入库，是客户端分片上传、无状态搬运、有状态服务端上传三条链路共用的底层原语；`m.Update()` 属 [FileOperation 接口](pkg/filemanager/manager/upload.go#L326-L367)，编排完整三段式（PrepareUpload → Upload → CompleteUpload），仅服务端任务（归档/解压/远程下载）调用。客户端上传确认（`UploadService.LocalUpload` → `processChunkUpload`）全程调 `m.Upload()` + `m.CompleteUpload()`，**不调 `m.Update()`**。
