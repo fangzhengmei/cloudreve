@@ -389,10 +389,191 @@ Worker 调度循环
 
 ---
 
-## 六、设计要点总结
+## 六、边界场景与主流程衔接
+
+本节补全四个容易和主流程脱节的边界：节点切换与旧句柄失效、种子文件选择、取消操作、落盘前校验。
+
+### 6.1 节点切换与旧下载句柄失效
+
+**问题背景**：`RemoteDownloadTask` 结构体中 `node`、`d`（downloader）、`state` 三个字段都不持久化，只有 `Task.PrivateState`（JSON 序列化的 `RemoteDownloadTaskState`）写入 DB。每次 `Do()` 都从 `NewRemoteDownloadTaskFromModel` 重建实例，所以 `m.d` 始终为 nil，每次迭代都基于当前选中的节点重新创建 downloader 实例。
+
+**节点选择流程**（每次 `Do()` 开头，`remote_download.go`）：
+
+```
+allocateNode(ctx, dep, &m.state.NodeState, NodeCapabilityRemoteDownload)
+    └─► NodePool.Get(ctx, capability, preferred = state.NodeID)
+```
+
+`weightedNodePool.Get`（`pkg/cluster/pool.go`）的行为：
+
+1. 若 `state.NodeID > 0`（已分配过节点），先在节点池中按 ID 精确匹配。
+2. **如果原节点已被管理员停用/删除**：`Upsert` 时会把它从 `p.nodes[capability]` 列表中移除，此时精确匹配失败，`selected == nil`。
+3. Fallback 到 WRR 加权轮询，选一个新节点，回写 `state.NodeID = newNode.ID()`。
+
+**旧 Handle 在新节点上失效的链路**：
+
+```
+节点 A 已停用 → allocateNode 选了节点 B → state.NodeID 改为 B
+    → node.CreateDownloader(ctx, ...) → 创建 B 的 aria2/slave downloader 实例
+    → m.d = newDownloader(B)
+    → switch Phase:
+        case monitor:
+            m.d.Info(ctx, m.state.Handle)
+                │  // Handle 是 A 的 aria2 上创建的，B 的 aria2 不认识
+                ▼
+            返回 ErrTaskNotFount
+                │
+                ├─► state.Status != nil（之前在 A 上已拿到过状态）
+                │       → 判定"用户手动取消" → 返回 StatusCanceled
+                │
+                └─► state.Status == nil（还没来得及在 A 上拿到任何状态）
+                        → GetTaskStatusTried++，ResumeAfter(Interval) 挂起重试
+                        → 连续 5 次后 → 返回 error → 队列级重试（指数退避）
+```
+
+**代码没有"检测到节点切换时自动在新节点重建下载任务"的逻辑**。`createDownloadTask` 中有 `if m.state.Handle != nil { Phase = monitor; return }` 的短路——即只要 Handle 存在就直接进 monitor，不会重新 CreateTask。所以一旦发生节点切换，任务要么被误判为 Canceled（有历史状态），要么重试 5 次后失败。
+
+slave 模式下 `Info` 返回 `ErrTaskNotFount` 的具体路径（`pkg/downloader/slave/slave.go`）：从节点 RPC 返回 `CodeNotFound` → `fmt.Errorf("%s (%w)", err, downloader.ErrTaskNotFount)`。
+
+### 6.2 种子文件选择（SetFilesToDownload）与主流程衔接
+
+**入口**：`service/explorer/workflows.go` 的 `SetDownloadFilesService.SetDownloadFiles()`。
+
+**关键特征**：这个操作**绕过队列调度**，直接从内存 `TaskRegistry` 取 Task 实例同步调用下载器 API。
+
+```
+SetDownloadFiles(c, taskID)
+    ├─► registry.Get(taskID)                    // 只能操作内存中仍存在的 Task
+    ├─► 校验：owner == 当前用户
+    ├─► 校验：Status == Suspending || Processing // 必须在活跃状态
+    ├─► 校验：Summary.Phase == "monitor"        // 必须在监控阶段
+    └─► downloadTask.SetDownloadTarget(c, files...)
+            ├─► 校验：state.Handle != nil
+            └─► m.d.SetFilesToDownload(ctx, handle, args...)  // 直接调下载器
+```
+
+**与主流程的衔接点**：
+
+- 用户的选择结果**不保存在 Task 的 PrivateState 中**，而是保存在下载器侧（aria2 通过 `changeUri` / `changePosition` RPC 实现）。
+- 下次 `monitor()` 调 `m.d.Info()` 时，下载器返回的 `status.Files` 中每个 `TaskFile.Selected` 字段会反映用户的选择。
+- `validateFiles`（6.4 节）和 `transfer` 阶段读取的 `status.Files` 中 `Selected=true` 的文件就是用户选中的。
+- BT 种子场景：aria2 创建任务后先解析种子文件，此阶段 `status.Files` 可能为空或未完整；解析完成后 `status.Total` 会变化，触发 `monitor` 中的 `Total != status.Total` 分支重新校验。用户需在此时才能看到文件列表并选择。
+
+**限制**：
+- 只能在 `monitor` 阶段调用，`transfer`/`seeding` 阶段会返回 `Task not in monitoring loop` 错误。
+- Task 从 registry 中删除后（completed/error/canceled 后由状态转移回调删除）无法再操作。
+
+### 6.3 取消操作与主流程衔接
+
+**入口**：`service/explorer/workflows.go` 的 `CancelDownloadTask()`，同样绕过队列调度，直接从 registry 取 Task。
+
+```
+CancelDownloadTask(c, taskID)
+    ├─► registry.Get(taskID)
+    ├─► 校验：owner == 当前用户
+    └─► downloadTask.CancelDownload(c)
+            ├─► if state.Handle == nil → return nil    // 还没创建下载任务，无需取消
+            └─► m.d.Cancel(ctx, handle)                 // 通知下载器取消
+```
+
+**与主流程的关系——取消是异步生效的**：
+
+取消 API 只通知下载器停掉任务，**不会立即改变 Task 的生命周期状态**。Task 的状态变迁要等下一次 `Do()` 迭代中 `monitor` 感知到：
+
+```
+Cancel API 调用 ──► 下载器取消任务
+                        │
+                        │  (Task 仍处于 suspending，等 ResumeTime 到期)
+                        ▼
+下次 Do() → monitor → m.d.Info(handle)
+                ├─► 返回 ErrTaskNotFount
+                ├─► state.Status != nil（已有历史状态）
+                └─► 返回 StatusCanceled
+                        │
+                        ▼
+            transit processing → canceled → Cleanup
+```
+
+**延迟问题**：如果 Task 处于 `suspending` 且 `ResumeTime` 在 1 分钟后，取消操作要等 Worker 下次取到该任务（最长 1 分钟 + `taskPullInterval`）才会生效。代码中没有"取消时主动唤醒调度器立即执行"的机制。
+
+**边界**：
+- Task 不在 registry 中（已结束被清理）→ API 返回 `Task not found`。
+- `Cleanup()` 也会调 `m.d.Cancel()`（兜底），所以即使取消 API 没调用，任务在 completed/error/canceled 时也会通知下载器清理。
+- 如果在 `createDownloadTask` 之前取消（`state.Handle == nil`），`CancelDownload` 直接返回 nil，Task 仍正常走 monitor 流程，下次 `Info` 会因 Handle 为 nil 而出错——实际上 `createDownloadTask` 中 `Handle != nil` 时会短路到 monitor，不会出现 Handle 为 nil 进 monitor 的情况。
+
+### 6.4 落盘前校验与触发时机
+
+**入口**：`remote_download.go` 的 `validateFiles()`，由 `monitor()` 在特定条件下调用。
+
+**触发时机**（`monitor()` 中）：
+
+```go
+if m.state.Status == nil || m.state.Status.Total != status.Total {
+    // 首次拿到下载器状态，或总大小变化（如种子解析完成、文件列表更新）
+    if err := m.validateFiles(ctx, dep, status); err != nil {
+        m.state.Status = status   // 即使校验失败也存状态
+        return task.StatusError, fmt.Errorf("... (%w)", queue.CriticalErr)
+    }
+}
+```
+
+两种触发条件：
+1. **首次拿到状态**（`state.Status == nil`）：下载器刚返回第一个 `TaskStatus`，此时才知道有多少文件、多大。
+2. **Total 变化**（`state.Status.Total != status.Total`）：例如 BT 种子刚创建时 aria2 还在解析，文件列表不完整；解析完成后 Total 变大，触发重新校验。
+
+**校验内容**（`validateFiles()` + `dbfs.PreValidateUpload()`）：
+
+```
+validateFiles(ctx, dep, status)
+    ├─► 解析 Dst URI
+    ├─► 过滤 status.Files 中 Selected=true 的文件
+    ├─► 校验至少有一个 Selected 文件
+    ├─► 构造 PreValidateFile 列表（文件名经 sanitizeFileName 替换非法字符）
+    └─► fm.PreValidateUpload(ctx, dstUri, validateArgs...)
+            ├─► 获取目标目录 navigator
+            ├─► 校验目标是文件夹
+            ├─► 校验当前用户是目标目录 owner
+            ├─► 获取存储策略
+            ├─► 逐文件校验：
+            │     ├─► validateFileSize（单文件大小限制）
+            │     └─► validateNewFile（扩展名黑白名单、文件名正则）
+            └─► validateUserCapacity(total)（用户剩余容量是否够）
+```
+
+**与主流程的关系——这是 transfer 之前的"预检"**：
+
+```
+monitor 轮询
+    ├─► d.Info() 返回 status
+    ├─► 首次/Total 变化 → validateFiles → 预检容量、扩展名、命名
+    │     ├─► 通过 → 继续
+    │     └─► 失败 → CriticalErr → StatusError（不重试）
+    │
+    ├─► status.State == seeding/completed
+    │       → Phase = transfer → ResumeAfter(0)
+    │
+    └─► transfer 阶段
+            ├─► 再次解析 Dst URI（CriticalErr）
+            ├─► 读取 status.Files 中 Selected=true 的文件
+            ├─► 跳过 Transferred 中已传的文件
+            └─► 逐文件上传到目标存储策略
+```
+
+校验的目的是**在下载完成后、传输开始前提前拦截**容量不足、扩展名被禁、文件名非法等问题，避免下载完了才发现传不上去浪费带宽。但注意：
+
+- **只校验 Selected 文件**：如果用户没通过 `SetFilesToDownload` 选过文件，下载器默认全部 Selected，则校验所有文件。
+- **失败不重试**：因为包装了 `CriticalErr`，队列级重试被跳过。
+- **Total 变化时重复校验**：如果下载器返回的 Total 在多次轮询中变化（例如种子分阶段解析），每次变化都会重新校验，避免漏检新增文件。
+
+---
+
+## 七、设计要点总结
 
 1. **"Suspending"不是阻塞，而是立即重新入调度器。** 转移回调里调 `q.QueueTask` 把任务 append 回去，ResumeTime 作为"到时才能取"的门槛——但该门槛只在栈顶生效。
 2. **`fifoScheduler` 实际是只看栈顶到期时间的 LIFO 栈，不是堆也不是 FIFO。** `Less` 方法是死代码；晚提交、短 ResumeTime 的任务会被优先取出，早提交的任务可能被压栈。
 3. **重试分两层：** 业务层轻量重试（如状态查询，5 次以内，短周期）失败后才交给队列层指数退避；致命错误用 `CriticalErr` 哨兵直接跳过重试。
 4. **断点续传以单文件为粒度：** `Transferred map[int]` 记录成功索引，Master 本地传与 Slave RPC 传均遵循此约定，失败重跑不会重复传已落盘的文件。
 5. **恢复能力依赖 PrivateState JSON 持久化：** Phase、Handle、NodeID、Transferred、SlaveUploadTaskID 等全量保存在 DB 中，进程重启后 `GetPendingTasks` 恢复即可无缝继续。
+6. **节点切换是未处理的边界缺陷：** 旧 Handle 在新节点上无效，有历史状态时被判 Canceled，无历史状态时重试 5 次后失败。代码没有检测节点切换并重建下载任务的逻辑。
+7. **文件选择、取消操作绕过队列直接操作下载器：** 通过内存 `TaskRegistry` 同步调用，不改变 PrivateState；效果在下一次 `monitor` 轮询中通过 `d.Info()` 返回值感知。取消是异步生效的，延迟取决于 ResumeTime。
+8. **落盘前校验在 monitor 阶段触发：** 首次拿到状态或 Total 变化时校验容量、扩展名、命名，失败直接 `CriticalErr` 不重试，避免下载完成后才发现无法传输。
