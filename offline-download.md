@@ -65,11 +65,16 @@ Cloudreve 的离线下载状态机分为三层：**任务生命周期状态** �
 
 ### 2.2 第二层：业务阶段（RemoteDownloadTaskState.Phase）
 
-状态保存在 `Task.PrivateState`（JSON 持久化），枚举值与行为定义于 `pkg/filemanager/workflows/remote_download.go`。由 `RemoteDownloadTask.Do()` 内的 switch 驱动：
+状态保存在 `Task.PrivateState`（JSON 持久化），枚举值与行为定义于 `pkg/filemanager/workflows/remote_download.go`。由 `RemoteDownloadTask.Do()` 内的 switch 驱动。
 
-| Phase | 行为 |
-|-------|------|
-| `""`（NotStarted） | 调用 `allocateNode` 分配节点、创建 Downloader 实例、校验 SSRF、调用下载器 `CreateTask`。之后 Phase 切到 `monitor`，返回 `StatusSuspending`。 |
+**所有 Phase 共享的 Do() 前置逻辑**（在 switch 之前执行，每次迭代都会走）：
+1. `json.Unmarshal(m.State(), state)` 重建 `m.state`
+2. `allocateNode` → `np.Get(capability, preferred = state.NodeID)` 选择节点（preferred 匹配成功则复用原节点，失败则 WRR 选新节点）
+3. 若 `m.d == nil`，基于当前选中的节点 `CreateDownloader` 创建下载器实例
+
+| Phase | 专属行为 |
+|-------|---------|
+| `""`（NotStarted） | 校验 SSRF、调用下载器 `CreateTask`。之后 Phase 切到 `monitor`，返回 `StatusSuspending`。 |
 | `monitor` / `seeding`（AwaitSeeding） | 按节点配置的 `Interval` 周期性调用下载器 `Info()`，根据第三层状态决定下一步。 |
 | `transfer` | 若节点是 Master：本机开 Worker 池并发上传到目标存储；若是 Slave：通过 RPC 在从节点创建 `SlaveUploadTask` 并轮询。完成后切到 `seeding`（AwaitSeeding）。 |
 
@@ -288,30 +293,43 @@ Do()
 | 维度 | 同进程内挂起恢复 | 服务重启恢复 |
 |------|-----------------|-------------|
 | Task 实例 | 同一个指针（registry 未删除） | 全新实例（NewFromModel 创建） |
-| `m.d` | 非 nil，不重新 `CreateDownloader` | nil，基于当前节点重新创建 |
-| `m.node` | 每次重新选节点，可能与 m.d 不一致 | 每次重新选节点，与新创建的 m.d 一致 |
 | 状态来源 | 反序列化上一次 Do() 写入的 PrivateState | 反序列化 DB 中最后一次持久化的 PrivateState |
+| 节点选择 | 每次 Do() 都调 `allocateNode`，preferred 匹配成功则复用原节点 | 每次 Do() 都调 `allocateNode`，preferred 匹配成功则复用原节点 |
+| `m.d`（下载器实例） | 非 nil（首次 Do() 创建后一直保留），不重新 `CreateDownloader` | nil，首次 Do() 时基于当前选中的节点创建 |
+| `m.node`（节点实例） | 每次 Do() 重新赋值为当前 allocateNode 的结果 | 每次 Do() 重新赋值为当前 allocateNode 的结果 |
 | Handle 有效性 | 由原节点的下载器持有，若节点未变则有效 | 若原节点未变且下载器未重启则有效；否则失效 |
 
-**代码没有区分这两条路径**，`Do()` 的开头对两种场景走同样的流程。这导致同进程内如果发生节点切换（原节点被删），`m.node` 变成新节点但 `m.d` 还是旧节点的 downloader，两者不一致。
+**代码没有区分这两条路径**，`Do()` 的开头对两种场景走同样的三步流程（反序列化 → allocateNode → 按需创建 downloader）。这导致同进程内如果发生节点切换（原节点被删，preferred 匹配失败，fallback 选新节点），`m.node` 变成新节点但 `m.d` 还是旧节点的 downloader，两者不一致。
 
-### 3.5 节点分配：加权轮询（WRR）
+### 3.5 节点分配：加权轮询（WRR）+ 优先复用
 
-离线下载任务首次执行（Phase `""`）时，在 `allocateNode`（`pkg/filemanager/workflows/worfklows.go`）中调 `NodePool.Get()` 分配一个具备 `NodeCapabilityRemoteDownload` 能力的节点。实现位于 `pkg/cluster/pool.go`：
+节点选择发生在**每次 `Do()` 开头**（`remote_download.go` 第 130-135 行），逻辑封装在 `allocateNode`（`pkg/filemanager/workflows/worfklows.go`）中：
+
+```go
+node, err := allocateNode(ctx, dep, &m.state.NodeState, types.NodeCapabilityRemoteDownload)
+m.node = node
+```
+
+`allocateNode` 调 `NodePool.Get(capability, preferred = state.NodeID)`，实现位于 `pkg/cluster/pool.go`：
 
 ```go
 func (p *weightedNodePool) Get(ctx, capability, preferred int) (Node, error) {
-    // 1) 若 state.NodeID 已指定（恢复执行场景），优先复用原节点
-    // 2) 否则对桶内每个节点：item.current += max(1, item.weight)
-    //    记录 current 最大的节点为 selected
-    // 3) selected.current -= total（所有权重之和）
-    // 4) 返回 selected.node
+    // 1) 若 preferred > 0（state.NodeID 已记录）：
+    //    在能力桶中按 ID 精确匹配
+    //    匹配成功 → 直接返回该节点，不修改 WRR 权重
+    //    匹配失败 → 继续第 2 步
+    //
+    // 2) 无 preferred 或匹配失败：执行标准平滑加权轮询
+    //    对桶内每个节点：item.current += max(1, item.weight)
+    //    选 current 最大者，然后 selected.current -= total
 }
 ```
 
-这是标准**平滑加权轮询**（Nginx WRR 同类算法）：权重 A=3, B=1 时的分配序列为 `A, A, B, A`，长周期比例精确匹配权重。
+这是**优先复用 + WRR 兜底**的两阶段策略：
+- **preferred 匹配成功**（绝大多数情况）：直接返回上次的节点，完全不碰 WRR 的 `current` 状态
+- **preferred 匹配失败**（原节点被管理员停用/删除）：走 WRR 算法选新节点，此时才会更新各节点的 `current` 权重
 
-节点分配后缓存到 `state.NodeID`，后续迭代（挂起→恢复）复用，不会在每次 `Do()` 时重新挑节点。
+`allocateNode` 返回后无条件写回 `state.NodeID = node.ID()`，所以除非原节点已不存在，每次迭代都会复用同一个节点。标准 WRR（Nginx 算法）的示例：权重 A=3, B=1，序列为 `A, A, B, A`，长周期比例精确匹配权重。
 
 ---
 
@@ -437,7 +455,8 @@ Worker 调度循环
   ├─► 再过一段时间，调度器又取到它（若栈顶没有更晚提交的任务）
   ├─► transit suspending → processing
   ├─► Do(): Phase="monitor"
-  │      ├─► 复用 state.NodeID 对应的 Slave A
+  │      ├─► allocateNode → preferred = state.NodeID → 精确匹配 Slave A 成功
+  │      ├─► m.d != nil，沿用首次 Do() 创建的 Slave A downloader
   │      ├─► d.Info(handle) → 返回 downloading + 进度
   │      ├─► ResumeAfter(Interval)
   │      └─► return StatusSuspending
