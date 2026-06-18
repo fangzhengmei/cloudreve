@@ -1,347 +1,398 @@
 # Cloudreve 离线下载任务处理路径分析
 
-本文档详细剖析 Cloudreve v4 中，离线下载任务从用户提交到最终文件落盘的完整处理链路，重点覆盖**状态机**、**调度策略**、**失败重试**三段核心实现。
+本文档详细剖析 Cloudreve v4 中，离线下载任务从用户提交到最终文件落盘的完整处理链路，重点覆盖**状态机**、**调度策略**、**失败重试**三段核心实现，并结合真实代码行为纠正"按 ResumeTime 堆排序"等常见误解。
 
 ---
 
-## 一、整体处理流程概览
+## 一、核心代码文件索引
 
-```
-用户提交 (API)
-    │
-    ▼
-任务创建 (NewRemoteDownloadTask)
-    │
-    ▼
-入队排队 (StatusQueued) ──────► 队列调度 (FIFO + ResumeTime 最小堆)
-    │                                    ▲
-    ▼                                    │
-Worker 取任务 (StatusProcessing)         │
-    │                                    │
-    ├─► Phase: NotStarted               │
-    │     └─ 分配节点 + 创建下载任务     │
-    │          └─ 进入 Monitor 阶段 ────►│ 返回 StatusSuspending
-    │                                    │
-    ├─► Phase: Monitor                  │
-    │     └─ 轮询下载器 (aria2/qBittorrent)
-    │          ├─ 下载中 ───────────────►│
-    │          ├─ 做种中 ───────────────►│
-    │          └─ 完成/错误 ──► 进入 Transfer 阶段
-    │
-    ├─► Phase: Transfer
-    │     ├─ Master: 并发上传 (worker pool)
-    │     └─ Slave:  RPC 调从节点创建 SlaveUploadTask 轮询
-    │          └─ 传输完成 ──► 进入 AwaitSeeding 阶段
-    │
-    └─► Phase: AwaitSeeding (等待做种结束)
-          └─ 全部完成 ──► StatusCompleted / Cleanup
-```
+以下使用仓库相对路径定位代码：
 
-**核心代码文件索引**：
-
-| 模块 | 文件路径 |
-|------|---------|
-| 任务工作流 | [remote_download.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go) |
-| 队列框架 | [queue.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/queue.go) / [scheduler.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/scheduler.go) / [task.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/task.go) |
-| 节点调度 | [pool.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/cluster/pool.go) / [node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/cluster/node.go) |
-| 下载器接口 | [downloader.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/downloader/downloader.go) |
-| API 入口 | [workflows.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go) |
-| 任务状态定义 | [task.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/ent/task/task.go) |
-| 队列配置 | [dependency.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/application/dependency/dependency.go#L689-L717) |
+| 模块 | 路径 |
+|------|------|
+| 离线下载工作流（任务阶段流转） | `pkg/filemanager/workflows/remote_download.go` |
+| 队列框架（Worker、状态转移、重试） | `pkg/queue/queue.go` |
+| 调度器（入队/出队） | `pkg/queue/scheduler.go` |
+| Task 接口、DBTask、状态转移表 | `pkg/queue/task.go` |
+| 队列参数默认值 | `pkg/queue/options.go` |
+| 节点池（节点分配） | `pkg/cluster/pool.go` |
+| Node 接口与 Master/Slave 实现 | `pkg/cluster/node.go` |
+| Downloader 接口定义 | `pkg/downloader/downloader.go` |
+| API 提交/列表/取消入口 | `service/explorer/workflows.go` |
+| Slave 侧任务创建/查询 | `service/node/task.go` |
+| 任务状态枚举（ent） | `ent/task/task.go` |
+| 远程下载队列构造（热重载） | `application/dependency/dependency.go` |
+| 工作流通用工具（allocateNode 等） | `pkg/filemanager/workflows/worfklows.go` |
 
 ---
 
-## 二、状态机实现
+## 二、三层状态机
 
-Cloudreve 的离线下载采用**三层嵌套状态机**设计：
+Cloudreve 的离线下载状态机分为三层：**任务生命周期状态** → **业务阶段** → **下载器内部状态**，逐层嵌套。
 
-### 2.1 第一层：任务生命周期状态 (Task.Status)
+### 2.1 第一层：任务生命周期状态（Task.Status）
 
-定义在 [ent/task/task.go#L90-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/ent/task/task.go#L90-L103)：
+定义于 `ent/task/task.go`，共 6 种：
 
-| 状态值 | 含义 | 触发时机 |
-|--------|------|---------|
-| `queued` | 已入队，等待被 Worker 取走 | `QueueTask()` 提交时 |
-| `processing` | 正在执行中 | Worker 从调度器取到任务时 |
-| `suspending` | 挂起中（等待外部条件，如下载完成/下次轮询） | 任务 `Do()` 返回 `StatusSuspending` |
-| `completed` | 全部完成（下载+传输+做种结束） | 所有阶段完成 |
-| `error` | 执行失败（超过重试上限/致命错误） | 重试耗尽/`CriticalErr` |
-| `canceled` | 用户主动取消 | 下载器返回 `ErrTaskNotFount` 且有历史状态 |
+| 枚举值 | 含义 |
+|--------|------|
+| `queued` | 已提交入队，等待 Worker 取走 |
+| `processing` | 正在被 Worker 执行（调用 `t.Do()`） |
+| `suspending` | 挂起中（需等待外部条件，如轮询间隔或重试退避） |
+| `completed` | 全部流程完成 |
+| `error` | 执行失败（重试耗尽或致命错误） |
+| `canceled` | 用户主动取消 |
 
-**状态转移矩阵** 定义在 [pkg/queue/task.go#L375-L473](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/task.go#L375-L473)：
+**状态转移表**定义于 `pkg/queue/task.go` 的 `stateTransitions` 变量：
 
 ```
-          ┌───────────────────────────────────────────────────┐
-          │                                                   ▼
-  (初始空) ──► queued ──► processing ──► suspending ──► processing ...
-                  │          │                                    │
-                  │          ├──────────────► completed ◄─────────┘
-                  │          ├──────────────► error
-                  │          └──────────────► canceled
-                  └──────────────► error
+  (初始空) ──► queued ──► processing ──┬──► suspending ──► processing (循环)
+                 │          │            │
+                 │          ├────────────┼──► completed
+                 │          ├────────────┼──► error
+                 │          └────────────┼──► canceled
+                 └───────────────────────┘
+                              queued ──► error
 ```
 
-关键转移逻辑：
-- **processing → suspending**：持久化状态后，调用 `q.QueueTask()` **重新入堆**等待 ResumeTime 到达
-- **processing → completed/error/canceled**：调用 `task.Cleanup()` 清理下载任务、临时目录，从 registry 删除
-- **suspending → processing**：调度器检测到 `ResumeTime <= now` 时出堆
+每个合法转移附带一个回调函数，关键动作如下：
 
-### 2.2 第二层：任务内部阶段 (RemoteDownloadTaskPhase)
+- **`"" → queued`**：`persistTask` —— 新建任务首次入队时持久化到 DB。
+- **`queued → processing`**：`persistTask` —— Worker 取到任务后更新状态。
+- **`processing → suspending`**：`persistTask` 之后**立即调用 `q.QueueTask(ctx, task)` 重新入调度器**（这是"挂起"的本质——不是停在那儿等，而是重新塞回调度器排队，等 ResumeTime 到了再被取到）。
+- **`processing → completed / error / canceled`**：先执行 `task.Cleanup()`（取消下载器任务、删临时目录、从 registry 移除），再持久化。
+- **`suspending → processing`**：`persistTask`，同时 `metric.DecSuspendingTask()`。
 
-定义在 [pkg/filemanager/workflows/remote_download.go#L43-L78](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L43-L78)，存储在 `PrivateState.Phase` 字段（JSON 序列化持久化）：
+### 2.2 第二层：业务阶段（RemoteDownloadTaskState.Phase）
 
-| 阶段值 | 含义 | 关键动作 |
-|--------|------|---------|
-| `""` (NotStarted) | 刚创建，尚未分配节点 | SSRF 校验 → 分配节点 → 创建下载器实例 → 调用 `CreateTask()` 交给 aria2/qB |
-| `monitor` | 监控下载进度 | 按 `NodeSetting.Interval` 轮询下载器 `Info()`，校验容量，检测状态变迁 |
-| `transfer` | 从节点临时目录传输到目标存储策略 | Master 本地并发上传 / Slave 通过 RPC 调从节点上传 |
-| `seeding` (AwaitSeeding) | 传输完成后等待做种结束 | 若 `WaitForSeeding=false` 直接完成 |
+状态保存在 `Task.PrivateState`（JSON 持久化），枚举值与行为定义于 `pkg/filemanager/workflows/remote_download.go`。由 `RemoteDownloadTask.Do()` 内的 switch 驱动：
 
-**阶段转移** 由 `Do()` 方法的 switch 驱动（[remote_download.go#L148-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L148-L159)）：
+| Phase | 行为 |
+|-------|------|
+| `""`（NotStarted） | 调用 `allocateNode` 分配节点、创建 Downloader 实例、校验 SSRF、调用下载器 `CreateTask`。之后 Phase 切到 `monitor`，返回 `StatusSuspending`。 |
+| `monitor` / `seeding`（AwaitSeeding） | 按节点配置的 `Interval` 周期性调用下载器 `Info()`，根据第三层状态决定下一步。 |
+| `transfer` | 若节点是 Master：本机开 Worker 池并发上传到目标存储；若是 Slave：通过 RPC 在从节点创建 `SlaveUploadTask` 并轮询。完成后切到 `seeding`（AwaitSeeding）。 |
 
-```go
-switch m.state.Phase {
-case RemoteDownloadTaskPhaseNotStarted:
-    next, err = m.createDownloadTask(ctx, dep)    // → Phase = monitor
-case RemoteDownloadTaskPhaseMonitor, RemoteDownloadTaskPhaseAwaitSeeding:
-    next, err = m.monitor(ctx, dep)               // 完成/做种 → Phase = transfer
-case RemoteDownloadTaskPhaseTransfer:
-    if m.node.IsMaster() {
-        next, err = m.masterTransfer(ctx, dep)    // 本机上传
-    } else {
-        next, err = m.slaveTransfer(ctx, dep)     // 调从节点
-    }                                              // → Phase = seeding
-}
-```
+`monitor` 阶段的关键分支（见 `remote_download.go` 的 `monitor()`）：
 
-### 2.3 第三层：下载器内部状态 (downloader.Status)
+| 下载器状态 | 动作 |
+|------------|------|
+| `downloading` | `ResumeAfter(Interval)`，返回 `StatusSuspending` 等下次轮询 |
+| `seeding` | 若尚未传输 → Phase 切 `transfer`，`ResumeAfter(0)` 立即再次执行；已传输且 `WaitForSeeding=false` → 直接 `StatusCompleted`；否则继续挂起等做种 |
+| `completed` | 若尚未传输 → Phase 切 `transfer`；否则 → `StatusCompleted` |
+| `error` / `unknown` | 返回 error 并包装 `CriticalErr`（不重试） |
 
-定义在 [pkg/downloader/downloader.go#L64-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/downloader/downloader.go#L64-L72)：
+另外，`monitor` 中还包含：
+- **Handle 跟随**：若下载器返回 `status.FollowedBy != nil`（例如 aria2 中种子任务创建完后产生新的下载任务），替换 `state.Handle` 并立即再执行一次。
+- **容量预校验**：首次拿到或 Total 变化时，调 `validateFiles` → `fm.PreValidateUpload` 检查用户容量、命名合法性等，失败直接 `CriticalErr`。
+- **状态查询失败容忍**：`GetTaskStatusTried` 连续失败 5 次才向上抛 error，中间每次 `ResumeAfter(Interval)` 挂起。
 
-| 状态值 | 含义 | → 第二层次映射 |
-|--------|------|--------------|
-| `downloading` | 下载进行中 | 保持 monitor，按 Interval 轮询 |
-| `seeding` | 下载完成，正在做种 | → Phase = transfer（先传文件） |
-| `completed` | 全部完成（含做种） | 若尚未传输 → Phase = transfer；若已传输 → StatusCompleted |
-| `error` | 下载失败 | → StatusError（标记 CriticalErr） |
-| `unknown` | 状态未知 | → StatusError（标记 CriticalErr） |
+### 2.3 第三层：下载器内部状态（downloader.Status）
 
-状态判定代码在 [monitor()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L288-L324) 中：
-- 下载中/做种中：返回 `StatusSuspending`，由 `ResumeAfter(Interval)` 控制下次轮询时间
-- 完成但未进入 transfer：切换 Phase 后立即 `ResumeAfter(0)` 触发下次执行
-- 做种配置关闭 (`WaitForSeeding=false`)：传输完成后直接 `StatusCompleted` 跳过等待
+定义于 `pkg/downloader/downloader.go`，由 aria2/qBittorrent/slave 三种适配器各自实现：
+
+| 枚举值 | 含义 |
+|--------|------|
+| `downloading` | 正在下载 |
+| `seeding` | 下载完成、正在做种（BT） |
+| `completed` | 所有动作结束 |
+| `error` | 下载失败 |
+| `unknown` | 下载器无响应或状态不明 |
+
+适配器位置：
+- Aria2：`pkg/downloader/aria2/aria2.go`
+- qBittorrent：`pkg/downloader/qbittorrent/qbittorrent.go`
+- Slave 代理（调从节点 RPC）：`pkg/downloader/slave/slave.go`
 
 ---
 
-## 三、调度策略
+## 三、调度策略：入队、取任务、恢复执行
 
-调度分为**三层**：任务队列调度、节点分配调度、文件传输并发调度。
+本节重点澄清：**`fifoScheduler` 并不是按 ResumeTime 排序的最小堆。**
 
-### 3.1 任务队列调度 (FIFO + ResumeTime 最小堆)
+### 3.1 实际数据结构：slice + 尾部弹出（近似 LIFO）
 
-实现于 [pkg/queue/scheduler.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/scheduler.go)：
+看 `pkg/queue/scheduler.go`：
 
-**数据结构**：
 ```go
 type fifoScheduler struct {
-    taskQueue taskHeap   // heap.Interface，按 ResumeTime 升序的最小堆
-    capacity  int        // 队列容量，0 表示无限
-    count     int        // 当前元素数
+    taskQueue taskHeap   // 底层是 []Task
+    count     int        // 元素数
+    ...
 }
+type taskHeap []Task
 
-func (h taskHeap) Less(i, j int) bool {
-    return h[i].ResumeTime() < h[j].ResumeTime()  // 早到期的先出堆
+// 虽然声明了 heap.Interface 的 5 个方法：
+func (h taskHeap) Len() int           { ... }
+func (h taskHeap) Less(i, j int) bool { return h[i].ResumeTime() < h[j].ResumeTime() }
+func (h taskHeap) Swap(i, j int)      { ... }
+func (h *taskHeap) Push(x any)        { *h = append(*h, x.(Task)) }
+func (h *taskHeap) Pop() any          { x := (*h)[len(*h)-1]; *h = (*h)[:len(*h)-1]; return x }
+```
+
+**但 `container/heap` 从未被 import，`heap.Init/Push/Pop/Fix` 一个都没调用。** 所以：
+
+- `Less()` 函数虽然写了"按 ResumeTime 升序"，但**从未被执行过**，只是死代码。
+- `fifoScheduler.Queue(task)` → `taskQueue.Push(task)` → 只是 `append` 到 slice **末尾**。
+- `fifoScheduler.Request()` → 检查 slice **最后一个**元素 `taskQueue[Len()-1]` 的 `ResumeTime <= now`：
+  - 到期 → `Pop()` 取最后一个元素（栈顶）返回。
+  - 未到期 → 直接返回 `ErrNoTaskInQueue`，**完全不检查 slice 前面的元素**。
+
+所以 `fifoScheduler` 的真实语义是：**一个带"只看栈顶到期时间"的 LIFO 栈**，名字里的 FIFO 是误导的。
+
+这带来的直接影响：
+- 新提交的任务（append 到尾部）总是被优先检查，可能导致早提交但 ResumeTime 未到的任务长期被压在栈底（直到栈顶任务全部出空才有机会被检查）。
+- 任务挂起后再次入队（见 2.1 节），会重新 append 到尾部，下次 `Request` 第一个就看到它——如果 ResumeTime 还没到，整个调度器就陷入"无任务可取"，直到 taskPullInterval 超时后再轮询一次。
+
+### 3.2 提交入队流程
+
+入口 1：用户 API 提交 → `service/explorer/workflows.go` 的 `CreateDownloadTask()`：
+```
+权限校验(GroupPermissionRemoteDownload)
+  → 目标目录 / 种子文件合法性检查
+  → 批量大小校验(Aria2BatchSize)
+  → 逐个 src 调 workflows.NewRemoteDownloadTask()
+  → dep.RemoteDownloadQueue(c).QueueTask(c, t)
+```
+
+入口 2：服务重启恢复 → `pkg/queue/queue.go` 的 `(q *queue).Start()`：
+```
+GetPendingTasks(ctx, "remote_download")  // 查 DB 中未完成的任务
+  → 逐个 NewTaskFromModel() 反序列化
+  → QueueTask(ctx, resumedTask)          // 与新提交共用同一条入队路径
+```
+
+`QueueTask` 的动作（`pkg/queue/queue.go`）：
+1. 若 `t.Status() != suspending`，先做 `"" → queued` 的状态转移（持久化 DB，生成 Task ID）。
+2. `q.scheduler.Queue(t)` → 把 Task append 到调度器 slice 尾部。
+3. `registry.Set(t.ID(), t)` → 登记到内存注册表（供 API 查询进度、取消等使用）。
+
+### 3.3 Worker 取任务与执行循环
+
+`(q *queue).start()` 的结构：
+
+```
+for {
+    q.schedule()             // 若忙 Worker < workerCount，向 ready 通道塞一个信号
+    <-q.ready                // 等有空闲 Worker
+
+    // 后台 goroutine 拉任务
+    go func() {
+        for {
+            t, err := q.scheduler.Request()
+            if t == nil {
+                // 取不到：sleep taskPullInterval（远程下载队列是 10s），然后重试
+                select {
+                case <-time.After(q.taskPullInterval):
+                case <-q.quit: return
+                }
+                continue
+            }
+            tasks <- t       // 拿到任务，送入主循环
+            return
+        }
+    }()
+
+    t := <-tasks
+    q.metric.IncBusyWorker()
+    go q.work(t)             // 执行任务
 }
 ```
 
-**取任务逻辑**（[scheduler.go#L60-L79](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/scheduler.go#L60-L79)）：
-```go
-func (s *fifoScheduler) Request() (Task, error) {
-    // ...
-    if s.taskQueue[s.taskQueue.Len()-1].ResumeTime() > time.Now().Unix() {
-        return nil, ErrNoTaskInQueue   // 堆顶都未到期，暂无可执行任务
+`q.work(t)`（单任务生命周期）：
+```
+transitStatus → processing
+for {
+    next, err := q.run(ctx, t)     // 调 t.Do()，内含重试逻辑
+    if err != nil {
+        transitStatus → error
+        break
     }
-    data := s.taskQueue.Pop()          // 弹出最早到期的任务
-    return data.(Task), nil
+    t.OnIterationComplete(...)
+    transitStatus → next           // 可能是 processing / suspending / completed / ...
+    if next != processing { break }
 }
 ```
 
-**Worker 模型**（[queue.go#L380-L438](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/queue.go#L380-L438)）：
-- 固定 Worker 数（`workerCount`，默认 CPU 核数，可通过 `QueueSetting.WorkerNum` 配置）
-- `schedule()` 检查忙 Worker 数未达上限时，向 `ready` 通道发信号
-- 收到信号后异步从调度器 `Request()` 取任务（无任务则按 `taskPullInterval=10s` 间隔重试）
-- 取到任务后用 goroutine 执行 `q.work(t)`
+注意 `q.run()` 内部会把需要重试的 error 吃掉、改写 next 为 `suspending`、设置 ResumeTime——所以 `work` 里看到的 `err` 已经是 nil，通过 `next == suspending` 走转移回调重新入队（见 2.1）。只有超过重试次数或属于 `CriticalErr` 的错误，才会让 `run` 返回 error，进而 `work` 中 transit 到 `error`。
 
-**RemoteDownloadQueue 专属配置**（[dependency.go#L689-L717](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/application/dependency/dependency.go#L689-L717)）：
-- 启动时从 DB 恢复所有 `remote_download` 类型的挂起/排队任务
-- `taskPullInterval = 10s`（远程下载任务对实时性不敏感）
-- 最大执行时间 `maxTaskExecution`（默认 60h）
-- 单例模式，可通过管理后台热重载
+### 3.4 节点分配：加权轮询（WRR）
 
-### 3.2 节点分配调度 (加权轮询 WRR)
+离线下载任务首次执行（Phase `""`）时，在 `allocateNode`（`pkg/filemanager/workflows/worfklows.go`）中调 `NodePool.Get()` 分配一个具备 `NodeCapabilityRemoteDownload` 能力的节点。实现位于 `pkg/cluster/pool.go`：
 
-实现于 [pkg/cluster/pool.go](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/cluster/pool.go)：
-
-**节点池初始化**：
-- 按 `NodeCapability`（如 `NodeCapabilityRemoteDownload`）分桶存储
-- 每个节点有 `weight`（管理员配置）和 `current`（当前加权值，初始 0）
-
-**选择算法**（[pool.go#L88-L146](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/cluster/pool.go#L88-L146)）——平滑加权轮询：
-```
-1. 若指定了 preferred NodeID（即 state.NodeID>0，任务恢复场景），优先用已分配节点
-2. 否则遍历桶内所有节点：
-     item.current += max(1, item.weight)
-     total += max(1, item.weight)
-     记录 current 最大的节点为 selected
-3. selected.current -= total   // 扣减总权重，保证长期公平
-4. 返回 selected.node
+```go
+func (p *weightedNodePool) Get(ctx, capability, preferred int) (Node, error) {
+    // 1) 若 state.NodeID 已指定（恢复执行场景），优先复用原节点
+    // 2) 否则对桶内每个节点：item.current += max(1, item.weight)
+    //    记录 current 最大的节点为 selected
+    // 3) selected.current -= total（所有权重之和）
+    // 4) 返回 selected.node
+}
 ```
 
-示例（权重 A=3, B=1）：
-| 请求 | A.current | B.current | total | 选中 | 调整后 |
-|------|-----------|-----------|-------|------|--------|
-| 1 | 0+3=3 | 0+1=1 | 4 | A | A=-1, B=1 |
-| 2 | -1+3=2 | 1+1=2 | 4 | A(同权先出现者) | A=-2, B=2 |
-| 3 | -2+3=1 | 2+1=3 | 4 | B | A=1, B=-1 |
-| 4 | 1+3=4 | -1+1=0 | 4 | A | A=0, B=0 |
+这是标准**平滑加权轮询**（Nginx WRR 同类算法）：权重 A=3, B=1 时的分配序列为 `A, A, B, A`，长周期比例精确匹配权重。
 
-结果分布 A:B = 3:1，符合权重。
-
-### 3.3 文件传输并发调度
-
-#### Master 节点（本机传输）
-
-实现于 [masterTransfer()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L428-L557)：
-- 信号量模式：缓冲通道 `worker` 容量 = `MaxParallelTransfer`（系统配置）
-- 每个待传文件从 `worker` 通道取一个 slot，goroutine 执行 `transferFunc`，完成后归还
-- `Transferred` map 记录已成功上传的文件索引，**断点续传粒度为单个文件**
-- 上传进度通过原子操作维护：单文件进度、总字节进度、总文件数进度
-
-#### Slave 节点（从节点传输）
-
-实现于 [slaveTransfer()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L326-L426)：
-- Master 不直接传文件，而是通过 `slaveNode.CreateTask()` 发起 RPC 在从节点创建 `SlaveUploadTask`
-- 每 30 秒轮询一次从节点任务状态（`ResumeAfter(30s)`）
-- 进度数据通过 `NodeState.progress` 从 SlaveTaskSummary 合并
-- 从节点任务部分成功时，Master 将已成功的文件索引记入 `Transferred`，**下次重建 Slave 任务时跳过这些文件**
+节点分配后缓存到 `state.NodeID`，后续迭代（挂起→恢复）复用，不会在每次 `Do()` 时重新挑节点。
 
 ---
 
-## 四、失败重试机制
+## 四、失败重试：队列级 + 业务级
 
-重试机制同样是**分层设计**，区分队列级（框架通用）与业务级（离线下载特有）。
+### 4.1 队列级重试（指数退避）
 
-### 4.1 队列级重试 (指数退避 Backoff)
+位置：`pkg/queue/queue.go` 的 `(q *queue).run()`，在 `t.Do(ctx)` 返回后：
 
-实现于 [queue.go#L296-L313](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/queue.go#L296-L313)：
+```go
+if err != nil
+    && q.maxRetry - t.Retried() > 0           // 还有重试配额
+    && !errors.Is(err, CriticalErr)            // 非致命错误
+    && atomic.LoadInt32(&q.stopFlag) != 1 {    // 队列未关闭
 
-**触发条件**（三者同时满足）：
-1. `t.Do()` 返回 error
-2. `maxRetry - t.Retried() > 0`（未超重试上限）
-3. 错误不包含 `CriticalErr`（非致命错误）
-4. 队列未进入关闭流程
-
-**退避算法**（`github.com/jpillora/backoff`）：
-```
-delay = retryDelay               // 若配置了固定延迟（RetryDelay）
-否则 delay = backoff.ForAttempt(n)
-       = min(backoffMaxDuration, 1000ms * backoffFactor^n)
-```
-
-默认参数（[options.go#L33-L43](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/options.go#L33-L43)）：
-- `backoffFactor = 2`
-- `backoffMaxDuration = 60s`
-- `retryDelay = 0`（启用指数退避）
-
-**重试计数**：每次重试前调用 `t.OnRetry(err)`，将错误记入 `ErrorHistory`，`RetryCount++`（[task.go#L304-L316](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/task.go#L304-L316)）。
-
-### 4.2 业务级重试：获取下载状态
-
-实现于 [monitor()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L250-L266)：
-
-```
-GetTaskStatusMaxTries = 5
+    t.OnRetry(err)                             // RetryCount++, 记入 ErrorHistory
+    b := &backoff.Backoff{Max: q.backoffMaxDuration, Factor: q.backoffFactor}
+    delay := q.retryDelay                      // 若配置了固定延迟就用它
+    if q.retryDelay == 0 {
+        delay = b.ForAttempt(float64(t.Retried()))   // 否则指数退避
+    }
+    t.OnSuspend(time.Now().Add(delay).Unix())  // 写 ResumeTime
+    err = nil
+    next = task.StatusSuspending               // 改走 suspending 路径
+}
 ```
 
-场景：下载器 RPC 调用失败（如 aria2 重启、网络波动），但任务本身仍可能有效。
+默认参数（`pkg/queue/options.go`，可通过管理后台的队列配置覆盖）：
 
-- 失败时 `GetTaskStatusTried++`，记录 warning 日志
-- 未达上限：按节点 `Interval` 正常挂起轮询
-- 达上限：向上返回 error，进入队列级重试（此时可能走指数退避，时间更长）
-- **特殊处理**：若 `ErrTaskNotFount` 且任务曾有状态记录 → 判定用户通过外部工具取消了任务 → `StatusCanceled`（不进入重试）
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `backoffFactor` | 2 | 指数底数 |
+| `backoffMaxDuration` | 60s | 单次延迟上限 |
+| `retryDelay` | 0 | 非 0 时忽略指数退避，用固定延迟 |
+| `maxRetry` | 0（具体值由管理后台配置） | 最多重试次数 |
+| `maxTaskExecution` | 60h | 单任务累计执行时间上限（含所有重试） |
+
+队列级重试后的路径：
+`run` 返回 `(StatusSuspending, nil)` → `work` 中 `transitStatus(processing → suspending)` → 转移回调 `q.QueueTask(ctx, task)` 重新 append 到调度器尾部 → 下次 Request 时检查 ResumeTime。
+
+### 4.2 业务级重试：下载状态查询
+
+位置：`remote_download.go` 的 `monitor()`。调用 `m.d.Info(ctx, handle)` 获取下载状态失败时：
+
+| 情况 | 处理 |
+|------|------|
+| `errors.Is(err, ErrTaskNotFount)` 且 `state.Status != nil` | 判定任务被外部（如 aria2 Web UI）手动删除 → 返回 `StatusCanceled` |
+| 其他错误，且 `GetTaskStatusTried < 5` | `GetTaskStatusTried++`，`ResumeAfter(Interval)` 挂起，**不上抛 error**，所以不走队列级退避（立即用节点 Interval 重试） |
+| 达到 `GetTaskStatusMaxTries = 5` | 向上返回 error → 进入队列级重试（指数退避） |
+
+这是两级重试的配合：网络抖动等临时故障先用短周期重试，持续失败再走长退避。
 
 ### 4.3 业务级重试：文件传输部分失败
 
-Master 模式（[remote_download.go#L548-L552](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L548-L552)）：
-- 传输中单个文件失败不立即中止，用 `AggregateError` 聚合
-- 全部文件遍历结束后，若 `failed > 0`，返回 error 进入队列级重试
-- `Transferred[index]` 已记录成功文件，**下次 Do() 迭代不会重复上传**（断点续传）
+传输阶段不使用"整个任务重来"，而是以**单个文件**为粒度断点续传。
 
-Slave 模式（[remote_download.go#L397-L416](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L397-L416)）：
-- 从节点任务结束（成功或失败）时，比对 `Transferred` 长度与待传文件数
-- 部分成功：将已传索引合并到 Master 的 `Transferred`，`SlaveUploadTaskID = 0`，返回 error
-- 队列级重试时，会重新创建不包含已传文件的 SlaveUploadTask
+**Master 本机上传**（`masterTransfer`）：
+- 信号量通道控制并发 `MaxParallelTransfer`。
+- 每个文件上传成功后，写入 `state.Transferred[file.Index] = nil`。
+- 全部文件处理完后，若 `failed > 0`，整体返回 error，触发队列级重试。下次 Do() 进入 transfer 阶段时，已在 `Transferred` 中的文件直接跳过，进度字节数也原子累加到总进度中。
 
-### 4.4 致命错误标记 (CriticalErr)
+**Slave 上传**（`slaveTransfer`）：
+- Master 通过 `node.CreateTask` 在从节点创建 `SlaveUploadTask`，记下 `state.SlaveUploadTaskID`。
+- 每 30s 轮询一次从节点任务状态。
+- 若从节点任务结束（完成或失败）但 `len(Transferred) < len(Files)`：
+  - 把从节点已成功的索引合并进 `state.Transferred`
+  - `SlaveUploadTaskID = 0`（下次重新创建一个只包含剩余文件的 SlaveUploadTask）
+  - 返回 error，走队列级重试
 
-定义于 [queue.go#L64-L66](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/queue/queue.go#L64-L66)：
-```go
-var CriticalErr = errors.New("non-retryable error")
-```
+### 4.4 致命错误（CriticalErr）
 
-**会被包装为 `%w` CriticalErr 的场景**（直接跳过重试进入 StatusError）：
+`CriticalErr`（`pkg/queue/queue.go`）是一个 sentinel，`errors.Is(err, CriticalErr)` 为 true 的错误**直接跳过所有队列级重试**，立即转 `StatusError`。在 `remote_download.go` 中会被包装的场景：
 
-| 场景 | 代码位置 |
-|------|---------|
-| SSRF 校验失败（用户输入恶意内网 URL） | [remote_download.go#L189-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L189-L191) |
-| 种子文件 URI 解析失败 | [remote_download.go#L197-L199](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L197-L199) |
-| 用户容量/配额预校验失败 | [remote_download.go#L279-L282](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L279-L282) |
-| 下载器返回 `StatusError` / `StatusUnknown` | [remote_download.go#L318-L320](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L318-L320) |
-| 目标 URI 解析失败（Transfer 阶段） | [remote_download.go#L334-L336](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L334-L336) |
-| Slave 任务被 Cancel | [remote_download.go#L419-L421](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L419-L421) |
-| Slave 状态反序列化失败 | [remote_download.go#L393-L395](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L393-L395) |
+| 场景 | 位置 |
+|------|------|
+| 用户提交的 URL 未通过 SSRF 校验 | `createDownloadTask` |
+| 种子文件内部 URI 非法 | `createDownloadTask` |
+| 用户容量 / 文件命名预校验失败 | `monitor`（首次拿到 Total 时） |
+| 下载器返回 `StatusError` / `StatusUnknown` | `monitor` |
+| 目标 URI 非法（transfer 阶段） | `slaveTransfer` / `masterTransfer` |
+| Slave 任务被 Cancel | `slaveTransfer` |
+| Slave 返回的状态反序列化失败 | `slaveTransfer` |
 
-### 4.5 任务取消与清理
+### 4.5 取消与清理
 
-用户发起取消：[workflows.go#L398-L414](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go#L398-L414) → 调 `CancelDownload()` → `downloader.Cancel(handle)`。
-
-自动清理（StatusCompleted / StatusError 时）：[Cleanup()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/pkg/filemanager/workflows/remote_download.go#L595-L609)
-- 取消下载器中的任务
-- Master 节点：删除 `SavePath` 临时目录（从节点需由对应流程单独清理）
-
----
-
-## 五、提交入口汇总
-
-| 动作 | API | 核心函数 |
-|------|-----|---------|
-| 提交下载任务 | `POST /api/v3/file/download` | [CreateDownloadTask()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go#L81-L169) |
-| 查看任务列表 | `GET /api/v3/task?category=downloading/downloaded` | [ListTasks()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go#L324-L384) |
-| 获取实时进度 | WebSocket / SSE | [TaskPhaseProgress()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go#L386-L396) |
-| 设置要下载的文件（种子） | `PUT /api/v3/task/:id/download` | [SetDownloadFiles()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go#L423-L452) |
-| 取消下载 | `DELETE /api/v3/task/:id/download` | [CancelDownloadTask()](file:///d:/fz/0601-2/solo-dogfeeding/code/32-Cloudreve/service/explorer/workflows.go#L398-L414) |
-
-### 提交流程关键校验
-
-```
-CreateDownloadTask()
-    ├─► 权限：GroupPermissionRemoteDownload
-    ├─► 批量大小：Aria2BatchSize（用户组配置）
-    ├─► 目标目录：必须存在且有 CreateFile 权限
-    ├─► SrcFile（种子文件）：必须存在且有 DownloadFile 权限
-    └─► 逐源创建 NewRemoteDownloadTask → RemoteDownloadQueue.QueueTask()
-```
+- **用户取消**：API 调 `service/explorer/workflows.go` 的 `CancelDownloadTask` → 类型断言到 `*RemoteDownloadTask` → `m.d.Cancel(ctx, handle)` 通知下载器停掉任务；但生命周期状态仍由后续 `Do()` 迭代中的 `monitor` 感知（遇到 `ErrTaskNotFount` 后走 `StatusCanceled`）。
+- **自动清理**：`transitStatus(processing → completed/error/canceled)` 回调中统一调 `task.Cleanup()`，对于远程下载即 `RemoteDownloadTask.Cleanup()`：
+  - 取消下载器任务（若 handle 存在）
+  - Master 节点：删除 `SavePath` 临时目录
+  - 从内存 `registry` 中删除任务（由转移回调处理）
 
 ---
 
-## 六、状态持久化说明
+## 五、完整流转时序示例
 
-任务状态分两部分持久化到 DB（`ent.Task` 表）：
+以"用户提交一个 BT 种子 → 分配到从节点 Slave → 下载 → 传输 → 做种完成"为例，串起所有环节：
 
-| 字段 | 内容 | 可见性 |
-|------|------|--------|
-| `status` | 第一层状态 (queued/processing/...) | 公开 |
-| `public_state` | `TaskPublicState`：RetryCount、ErrorHistory、Error、ResumeTime、ExecutedDuration | 公开（前端可见） |
-| `private_state` | `RemoteDownloadTaskState` JSON：Phase、Handle、Status、NodeID、Transferred、SlaveUploadTaskID 等 | 仅服务端内部使用 |
+```
+用户 POST /api/v3/file/download
+  │
+  ├─► CreateDownloadTask 校验权限/容量/批量大小
+  ├─► NewRemoteDownloadTask（Phase="", 状态=" "）
+  └─► RemoteDownloadQueue.QueueTask
+        ├─► transit "" → queued（持久化生成 Task ID）
+        └─► scheduler.Queue = append(slice, task)
+        └─► registry.Set(id, task)
 
-**服务重启恢复**：Queue `Start()` 时查询 DB 中 pending 状态的 `remote_download` 任务，用 `NewTaskFromModel()` 反序列化重建，重新入调度器。由于 PrivateState 完整保存了所有中间状态（包括下载器 Handle、已传文件列表），恢复后可从断点无缝继续。
+Worker 调度循环
+  │
+  ├─► scheduler.Request: 取 slice 尾部 → ResumeTime=0（默认值）< now → 出栈
+  ├─► transit queued → processing
+  ├─► Do(): Phase=""
+  │      ├─► allocateNode → NodePool.Get(NodeCapabilityRemoteDownload) → 选 Slave A
+  │      ├─► node.CreateDownloader → slave.NewSlaveDownloader
+  │      ├─► SSRF 校验 SrcUri
+  │      ├─► 调 slave RPC CreateTask(aria2, seedUrl) → 返回 TaskHandle
+  │      ├─► state.Phase = "monitor", state.Handle = {...}
+  │      └─► return StatusSuspending
+  ├─► transit processing → suspending
+  │      ├─► persistTask（写 DB，PrivateState 含 Phase/Handle/NodeID）
+  │      └─► q.QueueTask(task) → append 到 slice 尾部
+  │
+  ├─► 再过一段时间，调度器又取到它（若栈顶没有更晚提交的任务）
+  ├─► transit suspending → processing
+  ├─► Do(): Phase="monitor"
+  │      ├─► 复用 state.NodeID 对应的 Slave A
+  │      ├─► d.Info(handle) → 返回 downloading + 进度
+  │      ├─► ResumeAfter(Interval)
+  │      └─► return StatusSuspending
+  │
+  ├─► (重复 monitor → suspending → 入队 若干轮)
+  │
+  ├─► 某轮 d.Info() 返回 seeding
+  │      ├─► state.Phase = "transfer"
+  │      ├─► ResumeAfter(0)
+  │      └─► return StatusSuspending
+  │
+  ├─► 立即又被取到 → Do(): Phase="transfer", Slave
+  │      ├─► 构造 SlaveUploadTaskState（含每文件 src/dst/size/index）
+  │      ├─► node.CreateTask("slave_upload", state) → 得到 SlaveUploadTaskID
+  │      └─► return StatusSuspending
+  │
+  ├─► 每 30s 轮询 slaveNode.GetTask(SlaveUploadTaskID)
+  │      ├─► 合并进度到 NodeState.progress
+  │      ├─► Slave 任务 StatusCompleted + 所有文件 Transferred
+  │      ├─► state.Phase = "seeding"（AwaitSeeding）
+  │      └─► return StatusSuspending
+  │
+  └─► 后续 monitor 轮询：下载器状态仍为 seeding
+         ├─► 若节点配置 WaitForSeeding=true → 继续挂起轮询
+         └─► 某次 d.Info() 返回 completed
+               └─► return StatusCompleted → Cleanup → 结束
+```
+
+---
+
+## 六、设计要点总结
+
+1. **"Suspending"不是阻塞，而是立即重新入调度器。** 转移回调里调 `q.QueueTask` 把任务 append 回去，ResumeTime 作为"到时才能取"的门槛——但该门槛只在栈顶生效。
+2. **`fifoScheduler` 实际是只看栈顶到期时间的 LIFO 栈，不是堆也不是 FIFO。** `Less` 方法是死代码；晚提交、短 ResumeTime 的任务会被优先取出，早提交的任务可能被压栈。
+3. **重试分两层：** 业务层轻量重试（如状态查询，5 次以内，短周期）失败后才交给队列层指数退避；致命错误用 `CriticalErr` 哨兵直接跳过重试。
+4. **断点续传以单文件为粒度：** `Transferred map[int]` 记录成功索引，Master 本地传与 Slave RPC 传均遵循此约定，失败重跑不会重复传已落盘的文件。
+5. **恢复能力依赖 PrivateState JSON 持久化：** Phase、Handle、NodeID、Transferred、SlaveUploadTaskID 等全量保存在 DB 中，进程重启后 `GetPendingTasks` 恢复即可无缝继续。
