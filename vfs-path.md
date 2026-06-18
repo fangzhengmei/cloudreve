@@ -134,56 +134,110 @@ func (b *BooleanSet) Enabled(flag int) bool {
 }
 ```
 
-### 3.2 导航器能力集定义
+### 3.2 能力位枚举与占位符
 
-在 [navigator.go#L80-L149](pkg/filemanager/fs/dbfs/navigator.go#L80-L149) 中定义了四种导航器的能力集：
+能力位定义在 [navigator.go#L80-L108](pkg/filemanager/fs/dbfs/navigator.go#L80-L108)。**枚举并非连续**，其中插入了 9 个 `NavigatorCapability_CommunityPlacehodler1~9` 占位符，用于保持位序稳定、预留扩展位。这意味着 `BooleanSet` 的字节数组必须覆盖到最高位（`ModifyProps`），中间的占位位恒为 0：
 
 ```go
-// MyNavigator - 用户私有目录权限（最全）
+const (
+    NavigatorCapabilityCreateFile NavigatorCapability = iota   // 0
+    NavigatorCapabilityRenameFile                               // 1
+    NavigatorCapability_CommunityPlacehodler1                   // 2 (占位)
+    NavigatorCapability_CommunityPlacehodler2                   // 3 (占位)
+    NavigatorCapability_CommunityPlacehodler3                   // 4 (占位)
+    NavigatorCapability_CommunityPlacehodler4                   // 5 (占位)
+    NavigatorCapabilityUploadFile                               // 6
+    NavigatorCapabilityDownloadFile                             // 7
+    NavigatorCapabilityUpdateMetadata                           // 8
+    NavigatorCapabilityListChildren                             // 9
+    NavigatorCapabilityGenerateThumb                            // 10
+    NavigatorCapability_CommunityPlacehodler5                   // 11 (占位)
+    NavigatorCapability_CommunityPlacehodler6                   // 12 (占位)
+    NavigatorCapability_CommunityPlacehodler7                   // 13 (占位)
+    NavigatorCapabilityDeleteFile                               // 14
+    NavigatorCapabilityLockFile                                 // 15
+    NavigatorCapabilitySoftDelete                               // 16
+    NavigatorCapabilityRestore                                  // 17
+    NavigatorCapabilityShare                                    // 18
+    NavigatorCapabilityInfo                                     // 19
+    NavigatorCapabilityVersionControl                           // 20
+    NavigatorCapability_CommunityPlacehodler8                   // 21 (占位)
+    NavigatorCapability_CommunityPlacehodler9                   // 22 (占位)
+    NavigatorCapabilityEnterFolder                             // 23
+    NavigatorCapabilityModifyProps                              // 24
+)
+```
+
+### 3.3 四种导航器能力集（逐项校准）
+
+在 [navigator.go#L110-L150](pkg/filemanager/fs/dbfs/navigator.go#L110-L150) 的 `init()` 中注册。下表为逐项核对结果（✓=开启）：
+
+| 能力位 | MyNavigator | ShareNavigator | TrashNavigator | SharedWithMeNavigator |
+|--------|:---:|:---:|:---:|:---:|
+| CreateFile | ✓ | | | |
+| RenameFile | ✓ | | | |
+| UploadFile | ✓ | | | |
+| DownloadFile | ✓ | ✓ | | ✓ |
+| UpdateMetadata | ✓ | | | |
+| ListChildren | ✓ | ✓ | ✓ | ✓ |
+| GenerateThumb | ✓ | ✓ | | |
+| DeleteFile | ✓ | | ✓ | |
+| LockFile | ✓ | ✓ | ✓ | |
+| SoftDelete | ✓ | | | |
+| Restore | | | ✓ | |
+| Share | ✓ | | | |
+| Info | ✓ | ✓ | ✓ | |
+| VersionControl | ✓ | ✓ | | |
+| EnterFolder | ✓ | ✓ | | ✓ |
+| ModifyProps | ✓ | ✓ | | |
+| **合计** | **15** | **8** | **5** | **3** |
+
+对应源码（精简标注）：
+
+```go
+// MyNavigator - 15 项（用户私有目录，最全）
 boolset.Sets(map[NavigatorCapability]bool{
-    NavigatorCapabilityCreateFile:     true,
-    NavigatorCapabilityRenameFile:     true,
-    NavigatorCapabilityUploadFile:     true,
-    NavigatorCapabilityDownloadFile:   true,
-    NavigatorCapabilityUpdateMetadata: true,
-    NavigatorCapabilityListChildren:   true,
-    NavigatorCapabilityDeleteFile:     true,
-    NavigatorCapabilitySoftDelete:     true,
-    NavigatorCapabilityShare:          true,
-    NavigatorCapabilityVersionControl: true,
-    // ... 共17项权限
+    NavigatorCapabilityCreateFile: true, NavigatorCapabilityRenameFile: true,
+    NavigatorCapabilityUploadFile: true, NavigatorCapabilityDownloadFile: true,
+    NavigatorCapabilityUpdateMetadata: true, NavigatorCapabilityListChildren: true,
+    NavigatorCapabilityGenerateThumb: true, NavigatorCapabilityDeleteFile: true,
+    NavigatorCapabilityLockFile: true, NavigatorCapabilitySoftDelete: true,
+    NavigatorCapabilityShare: true, NavigatorCapabilityInfo: true,
+    NavigatorCapabilityVersionControl: true, NavigatorCapabilityEnterFolder: true,
+    NavigatorCapabilityModifyProps: true,
 }, myNavigatorCapability)
 
-// ShareNavigator - 分享目录权限（只读为主）
+// ShareNavigator - 8 项（含 LockFile / EnterFolder / ModifyProps，非纯只读）
 boolset.Sets(map[NavigatorCapability]bool{
-    NavigatorCapabilityDownloadFile:   true,
-    NavigatorCapabilityListChildren:   true,
-    NavigatorCapabilityGenerateThumb:  true,
-    NavigatorCapabilityInfo:           true,
-    NavigatorCapabilityVersionControl: true,
+    NavigatorCapabilityDownloadFile: true, NavigatorCapabilityListChildren: true,
+    NavigatorCapabilityGenerateThumb: true, NavigatorCapabilityLockFile: true,
+    NavigatorCapabilityInfo: true, NavigatorCapabilityVersionControl: true,
+    NavigatorCapabilityEnterFolder: true, NavigatorCapabilityModifyProps: true,
 }, shareNavigatorCapability)
 
-// TrashNavigator - 回收站权限
+// TrashNavigator - 5 项（含 LockFile / Info）
 boolset.Sets(map[NavigatorCapability]bool{
-    NavigatorCapabilityListChildren: true,
-    NavigatorCapabilityDeleteFile:   true,
-    NavigatorCapabilityRestore:      true,
+    NavigatorCapabilityListChildren: true, NavigatorCapabilityDeleteFile: true,
+    NavigatorCapabilityLockFile: true, NavigatorCapabilityRestore: true,
+    NavigatorCapabilityInfo: true,
 }, trashNavigatorCapability)
 
-// SharedWithMeNavigator - 分享给我权限
+// SharedWithMeNavigator - 3 项（含 EnterFolder）
 boolset.Sets(map[NavigatorCapability]bool{
-    NavigatorCapabilityListChildren: true,
-    NavigatorCapabilityDownloadFile: true,
+    NavigatorCapabilityListChildren: true, NavigatorCapabilityDownloadFile: true,
+    NavigatorCapabilityEnterFolder: true,
 }, sharedWithMeNavigatorCapability)
 ```
 
-### 3.3 权限叠加流程
+> 校准说明：之前文档误记 ShareNavigator 为 5 项（漏 LockFile/EnterFolder/ModifyProps）、TrashNavigator 为 3 项（漏 LockFile/Info）、SharedWithMeNavigator 为 2 项（漏 EnterFolder）、MyNavigator 为 17 项。实际分别为 8/5/3/15 项。ShareNavigator 并非“纯只读”——它支持 LockFile（对分享文件加锁）、ModifyProps（修改视图设置），但不允许任何写入类操作（Create/Rename/Upload/Delete/SoftDelete/Share）。
 
-权限叠加发生在 **导航器初始化** 和 **目录遍历** 两个阶段，叠加的结果是“导航器能力集”与“文件系统语义”的交集：
+### 3.4 权限叠加流程（校准：子集判定而非与运算）
+
+权限叠加发生在 **导航器初始化** 与 **目录遍历** 两个阶段：
 
 ```
 1. 导航器初始化时定义基础能力集
-   [navigator.go#L111-L149](pkg/filemanager/fs/dbfs/navigator.go#L111-L149)
+   [navigator.go#L110-L150](pkg/filemanager/fs/dbfs/navigator.go#L110-L150)
          │
          ▼
 2. 根目录创建时绑定能力集
@@ -191,13 +245,13 @@ boolset.Sets(map[NavigatorCapability]bool{
    root.CapabilitiesBs = n.Capabilities(false).Capability
          │
          ▼
-3. 子文件创建时从父目录继承
+3. 子文件创建时从父目录逐级继承（原样拷贝）
    [file.go#L329-L353](pkg/filemanager/fs/dbfs/file.go#L329-L353)
    ├─► newFile(parent, model) 时
    └─► f.CapabilitiesBs = parent.CapabilitiesBs
          │
          ▼
-4. 操作前校验权限
+4. getNavigator 选择导航器时做“子集判定”
    [dbfs.go#L763-L769](pkg/filemanager/fs/dbfs/dbfs.go#L763-L769)
    capabilities := res.Capabilities(false).Capability
    for _, capability := range requiredCapabilities {
@@ -207,9 +261,12 @@ boolset.Sets(map[NavigatorCapability]bool{
    }
 ```
 
-> 关键点：`getNavigator()` 在创建导航器时会传入 `requiredCapabilities`，导航器工厂内部用这些能力位与目标文件能力集做“与”运算，从而把“当前用户所在视图是否允许该动作”叠加到最终结果上。能力集不是动态计算的，而是根目录一次性写入、子节点继承的位图，叠加发生在校验时的 `Enabled()` 逐位判断中。
+> **校准关键点**：之前文档称“导航器工厂用能力位与目标文件能力集做‘与’运算”，这是不准确的。实际机制是：
+> 1. 每个导航器把**自己的能力集**盖写到根目录的 `CapabilitiesBs`，子节点原样继承，整棵 File 树共享同一份能力集；
+> 2. `getNavigator()` 收到调用方传入的 `requiredCapabilities`（如上传时传 `NavigatorCapabilityUploadFile`+`NavigatorCapabilityLockFile`），逐一用 `Enabled()` 判断这些**必需位**是否都在导航器能力集中——这是“**必需位 ⊆ 已启用位**”的子集判定，不是两个独立集合的按位与；
+> 3. 同一逻辑文件在不同导航器下会重建出**不同的 File 对象**（各自盖写各自的能力集），所有者视图与访问者视图的能力集不会出现在同一对象上做运算，因此不存在“交集”——访问者视图的能力完全由其导航器决定。
 
-### 3.4 跨驱动权限叠加的特殊场景
+### 3.5 跨驱动权限叠加的特殊场景
 
 **场景1：访问他人分享的文件**
 
@@ -243,7 +300,7 @@ if targetUser.Status != user.StatusActive &&
 }
 ```
 
-### 3.5 所有权检查
+### 3.6 所有权检查
 
 在 [manage.go](pkg/filemanager/fs/dbfs/manage.go) 中，每个修改操作前都会检查所有权：
 
@@ -256,7 +313,7 @@ if _, ok := ctx.Value(ByPassOwnerCheckCtxKey{}).(bool); !ok && target.Owner().ID
 
 可通过 `WithBypassOwnerCheck()` 绕过所有权检查（供系统内部调用）。
 
-### 3.6 存储驱动权限关系
+### 3.7 存储驱动权限关系
 
 跨驱动权限不仅取决于导航器能力，还取决于“用户所在用户组能否使用目标存储策略”。这一层关系在 [inventory/policy.go](inventory/policy.go#L145-L155) 中体现：
 
@@ -434,7 +491,93 @@ updateStateless(ctx, req, o)
 
 > 权限叠加在迁移链路的体现：跨节点搬运时，主节点 `PrepareUpload` 内部会重新走一遍 `getNavigator` + 能力校验（`NavigatorCapabilityUploadFile` + `NavigatorCapabilityLockFile`，见 [dbfs/upload.go#L74](pkg/filemanager/fs/dbfs/upload.go#L74)）和所有权检查（[dbfs/upload.go#L105-L107](pkg/filemanager/fs/dbfs/upload.go#L105-L107)）。也就是说，即使数据来自从节点的 RPC，主节点仍会以“当前用户视图”重新叠加导航器能力，不会因为跨节点而绕过权限。
 
-### 4.5 失败回滚与清理
+### 4.5 压缩任务产物上传触发
+
+`CreateArchiveTask`（压缩）与 `ExtractArchiveTask`（解压）在产物入库时均复用 `fm.Update()`，但**触发分支依节点角色而异**——这是此前文档遗漏的一条关键迁移触发链路。分支选择的根因在于 `NewFileManager()` 的初始化逻辑：当节点处于 SlaveMode 或传入 user 为 nil 时，返回的 manager 恒为 stateless（[manager.go#L152-L156](pkg/filemanager/manager/manager.go#L152-L156)、[manager.go#L173-L184](pkg/filemanager/manager/manager.go#L173-L184)），其 `m.stateless` 为 true，`fm.Update()` 会自动路由到 `updateStateless()`（[manager/upload.go#L345-L347](pkg/filemanager/manager/upload.go#L345-L347)）。
+
+#### 4.5.1 CreateArchiveTask 产物上传
+
+`CreateArchiveTask.Do()` 根据所分配节点是否为 master 走两条不同路径（[archive.go#L137-L167](pkg/filemanager/workflows/archive.go#L137-L167)）：
+
+**主节点路径**（3 阶段，全部本地完成）：
+
+```
+Phase: NotStarted    → initializeTempFolder()    准备临时目录
+Phase: CompressFiles → createArchiveFile()      本地压缩生成 zip
+Phase: UploadArchive → uploadArchive()          ← 产物上传触发点
+    └─► fm.Update(ctx, fileData)                有状态服务端上传
+         （archive.go#L471，不传 WithStatelessUserID）
+```
+
+**从节点路径**（4 阶段，压缩与上传分离到从节点）：
+
+```
+Phase: NotStarted → listEntitiesAndSendToSlave()
+    └─► DryRun 收集实体列表 + 策略 → 创建 SlaveCreateArchiveTask 到从节点
+Phase: AwaitSlaveCompressing → awaitSlaveCompressing()
+    └─► 轮询从节点压缩任务，取回 ZipFilePath
+Phase: CreateAndAwaitSlaveUploading → createAndAwaitSlaveUploading()
+    └─► 创建 SlaveUploadTask 到从节点（携带 zip 临时路径）   ← 产物上传触发点
+         从节点 SlaveUploadTask.Do() → fm.Update(WithNode, WithStatelessUserID, WithNoEntityType)
+Phase: CompleteUpload → completeUpload()
+    └─► 空操作！直接返回 StatusCompleted
+         （archive.go#L368-L370）
+```
+
+> **校准关键点**：从节点路径中，主节点的 `completeUpload()` 是**空操作**（仅 `return task.StatusCompleted, nil`）——因为从节点的无状态上传已经通过 RPC 在主节点完成了 `CompleteUpload`（占位升级 + 版本裁剪 + 事务提交），主节点无需再做任何 DB 操作。这与"主节点需要在 completeUpload 阶段做实体入库"的理解不同。
+
+#### 4.5.2 ExtractArchiveTask 产物上传
+
+解压任务对**每个解压出的文件**逐一触发 `fm.Update()`，同样依节点角色分两条路径：
+
+| 节点角色 | 触发方法 | fm.Update 调用 | 代码位置 |
+|---------|---------|---------------|---------|
+| 主节点 | `masterExtractArchive()` | `fm.Update(ctx, fileData, WithNoEntityType)` | [extract.go#L429](pkg/filemanager/workflows/extract.go#L429) |
+| 从节点 | `SlaveExtractArchiveTask.Do()` | `fm.Update(ctx, fileData, WithNode, WithStatelessUserID, WithNoEntityType)` | [extract.go#L803](pkg/filemanager/workflows/extract.go#L803) |
+
+目录创建走 `fm.Create()`（主节点 [extract.go#L398](pkg/filemanager/workflows/extract.go#L398) / 从节点 [extract.go#L772](pkg/filemanager/workflows/extract.go#L772)），同样区分有无 `WithStatelessUserID`。
+
+#### 4.5.3 各任务 fm.Update 分支汇总
+
+| 调用场景 | 节点角色 | manager 类型 | 选项 | 走哪条分支 |
+|---------|---------|------------|------|-----------|
+| 客户端分片最后一片 | 主/从 | stateful | 无 | `Update()` stateful |
+| 归档产物上传 | master | stateful | 无 | `Update()` stateful |
+| 归档产物上传 | slave | stateless | `WithNode`+`WithStatelessUserID`+`WithNoEntityType` | `updateStateless()` |
+| 解压文件上传 | master | stateful | `WithNoEntityType` | `Update()` stateful |
+| 解压文件上传 | slave | stateless | `WithNode`+`WithStatelessUserID`+`WithNoEntityType` | `updateStateless()` |
+| 远程下载入库 | master | stateful | `WithNoEntityType` | `Update()` stateful |
+| 远程下载入库 | slave | stateless | 创建 `SlaveUploadTask` | `updateStateless()` |
+
+> 同一个 `fm.Update()` 调用，在主节点（stateful manager）走三段本地调用（PrepareUpload → Upload → CompleteUpload），在从节点（stateless manager）走三段 RPC（PrepareUpload RPC → 本地 Put → CompleteUpload RPC）。分支选择不取决于调用方传了什么选项，而取决于 **manager 实例本身的 `stateless` 标志**——选项（`WithNode`/`WithStatelessUserID`）只是为 RPC 提供必要参数。
+
+### 4.6 无状态搬运与客户端上传确认的对比
+
+仓库中存在三种"数据入库"链路，它们的触发方、凭证模型、Session 管理、失败回滚方式各有不同。此前文档将"无状态搬运"与"客户端上传确认"混为一谈，下表逐项校准：
+
+| 维度 | 客户端上传确认 | 无状态搬运（stateless） | 有状态服务端上传（stateful） |
+|------|-------------|-------------------|---------------------|
+| **触发方** | 外部客户端（HTTP API） | 从节点任务（SlaveUploadTask / SlaveExtractArchiveTask） | 主节点任务（archive / extract / remote_download on master） |
+| **入口方法** | `CreateUploadSessionService.Create` → `m.CreateUploadSession` | `fm.Update(WithStatelessUserID, WithNode)` | `fm.Update()`（无 stateless 选项） |
+| **manager 类型** | stateful（`NewFileManager(dep, user)`） | stateless（`NewFileManager(dep, nil)`） | stateful（`NewFileManager(dep, user)`） |
+| **凭证生成** | 生成 `UploadCredential`（S3 presigned URL / OSS token），返回给客户端 | 无外部凭证，从节点直接 driver.Put | 无外部凭证，主节点直接 driver.Put |
+| **Session 缓存** | KV（`UploadSessionCachePrefix`，TTL = UploadSessionTTL）+ 可选哨兵任务 | RPC 响应内存传递，**不入 KV** | 进程内传递，**不入 KV** |
+| **分片确认** | `ConfirmUploadSession()` 校验分片偏移、锁令牌、策略中转约束 | 无分片（整文件 Put） | 无分片（整文件 Put） |
+| **中转约束** | `ConfirmUploadSession`：非本地 + 非中转 → `CodePolicyNotAllowed`（[upload.go#L168-L170](pkg/filemanager/manager/upload.go#L168-L170)） | 无此约束（从节点本地 Put，不经客户端中转） | 无此约束（主节点本地 Put） |
+| **物理写入** | 客户端直传存储（非中转）或 Cloudreve relay Put | 从节点 `CastStoragePolicyOnSlave` 后 driver.Put | 主节点 driver.Put |
+| **完成入库** | `CompleteUpload`：driver.CompleteUpload + DBFS.CompleteUpload | RPC `CompleteUpload` → 主节点 DBFS.CompleteUpload | 本地 `CompleteUpload`：driver.CompleteUpload + DBFS.CompleteUpload |
+| **哨兵清理** | `UploadSentinelCheckTask`（COS/S3 超时兜底，[upload.go#L501-L548](pkg/filemanager/manager/upload.go#L501-L548)） | **无**（无外部客户端超时风险） | **无** |
+| **失败回滚** | `OnUploadFailed`：释放锁 / 删占位文件 / 版本回滚 | RPC `OnUploadFailed` → 主节点回滚 + 从节点 driver.Delete | `OnUploadFailed`：释放锁 / 删占位文件 / 版本回滚 |
+| **返回值** | `fs.File`（返回给客户端） | `nil, nil`（从节点不需要 File 对象） | `fs.File` |
+| **后续任务** | `onNewEntityUploaded`：媒体元数据 + 全文索引 | **跳过**（[upload.go#L439](pkg/filemanager/manager/upload.go#L439) `if !m.stateless`） | `onNewEntityUploaded`：媒体元数据 + 全文索引 |
+
+> **核心差异总结**：
+> 1. **客户端上传确认**是"先发凭证、客户端自行上传、再回调确认"的异步两段式（CreateUploadSession → 客户端传 → CompleteUpload），需要 KV 缓存 Session 和哨兵兜底超时；
+> 2. **无状态搬运**是"从节点本地读文件 → RPC 到主节点建占位 → 本地 Put → RPC 完成入库"的同步三段式，Session 不入 KV、无哨兵、无客户端凭证，但**主节点仍完整执行能力校验与所有权检查**（见 4.4 节权限叠加说明）；
+> 3. **有状态服务端上传**是无状态搬运的"本地版"——同样的三段式但全部在主节点进程内完成，返回 File 对象并触发后续媒体/索引任务。
+> 4. 三者的 DB 层实体入库逻辑（占位创建 → 升级提交 → 版本裁剪 → StorageDiff）完全一致，差异仅在于**物理写入由谁执行**（客户端 / 从节点 / 主节点）和**DB 操作经由什么通道**（HTTP 回调 / RPC / 本地调用）。
+
+### 4.7 失败回滚与清理
 
 迁移/上传失败时由 [OnUploadFailed()](pkg/filemanager/manager/upload.go#L369-L397) 处理：
 
@@ -443,7 +586,7 @@ updateStateless(ctx, req, o)
 
 占位实体超时未完成时，由 `UploadSentinelCheckTask`（[manager/upload.go#L501-L548](pkg/filemanager/manager/upload.go#L501-L548)）兜底清理：删除占位 Entity 的物理源文件并取消上传凭证。
 
-### 4.6 涉及的关键组件
+### 4.8 涉及的关键组件
 
 | 组件 | 职责 | 文件 |
 |------|------|------|
@@ -492,6 +635,12 @@ updateStateless(ctx, req, o)
 | 存储路径生成 | [dbfs.go#L788-L803](pkg/filemanager/fs/dbfs/dbfs.go#L788-L803) |
 | 存储策略获取 | [dbfs.go#L669-L682](pkg/filemanager/fs/dbfs/dbfs.go#L669-L682) |
 | 跨节点搬运任务 | [pkg/filemanager/workflows/upload.go](pkg/filemanager/workflows/upload.go) |
+| 压缩任务（产物上传触发） | [pkg/filemanager/workflows/archive.go](pkg/filemanager/workflows/archive.go) |
+| 解压任务（产物上传触发） | [pkg/filemanager/workflows/extract.go](pkg/filemanager/workflows/extract.go) |
+| 远程下载入库任务 | [pkg/filemanager/workflows/remote_download.go](pkg/filemanager/workflows/remote_download.go) |
+| manager stateless 判定 | [manager.go#L152-L184](pkg/filemanager/manager/manager.go#L152-L184) |
+| 客户端上传会话创建 | [manager/upload.go#L50-L147](pkg/filemanager/manager/upload.go#L50-L147) |
+| 客户端分片确认 | [manager/upload.go#L149-L182](pkg/filemanager/manager/upload.go#L149-L182) |
 | 无状态上传入库 | [manager/upload.go#L400-L436](pkg/filemanager/manager/upload.go#L400-L436) |
 | 占位实体创建/升级 | [dbfs/upload.go#L72-L260](pkg/filemanager/fs/dbfs/upload.go#L72-L260)、[dbfs/upload.go#L262-L366](pkg/filemanager/fs/dbfs/upload.go#L262-L366) |
 | 主节点 RPC 入口 | [service/node/rpc.go](service/node/rpc.go) |
@@ -509,6 +658,7 @@ updateStateless(ctx, req, o)
 4. **导航器模式**：新增文件系统类型只需实现 Navigator 接口。
 5. **上下文缓存**：File 对象缓存子节点，减少 DB 查询。
 6. **占位-落盘-升级三段式入库**：跨节点场景下主节点先建占位、从节点落盘、主节点升级提交，兼顾事务原子性与物理传输解耦。
+7. **manager stateless 自动路由**：`NewFileManager(dep, u)` 在 SlaveMode 或 `u == nil` 时返回 stateless manager（`m.stateless = true`），使同一 `fm.Update()` 调用在主节点走本地三段、在从节点自动走 RPC 三段，调用方代码无需感知节点角色差异。
 
 ### 6.2 注意事项
 
@@ -524,3 +674,7 @@ updateStateless(ctx, req, o)
 5. **主从权限不绕过**：跨节点 RPC 仍会在主节点重新叠加导航器能力与所有权检查，从节点只负责物理传输，不持有业务权限决策。
 
 6. **版本保留与清理**：`CompleteUpload` 通过 `CapEntities` 按所有者版本保留设置裁剪旧实体，裁剪产生的 `StorageDiff` 会触发物理文件回收任务（`ExplicitEntityRecycleTask`），迁移时需注意旧实体回收的异步性。
+
+7. **三种上传链路不可混用**：客户端上传确认（`CreateUploadSession` + `ConfirmUploadSession` + `CompleteUpload`）、无状态搬运（`updateStateless`）、有状态服务端上传（stateful `Update`）是三条独立链路（详见 4.6 节）。客户端上传确认有 KV 缓存、凭证生成、哨兵兜底；后两者无 KV、无凭证、无哨兵。二次开发若需在服务端搬运文件，应通过 `fm.Update()` 走 stateful 或 stateless 分支（由 `NewFileManager` 的 user 参数决定），**不要**混用 `CreateUploadSession`（那会生成客户端凭证并入 KV，服务端任务无法消费）。
+
+8. **归档从节点路径的 completeUpload 是空操作**：`CreateArchiveTask` 在从节点路径下，压缩和上传均委托给从节点的 Slave 任务完成，主节点的 `completeUpload()` 阶段仅返回 `StatusCompleted` 不做任何 DB 操作——因为从节点的无状态上传已通过 RPC 在主节点完成了实体入库。二次开发若扩展归档任务，不应在 `completeUpload` 阶段重复执行实体入库逻辑。
