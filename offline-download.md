@@ -216,7 +216,86 @@ for {
 
 注意 `q.run()` 内部会把需要重试的 error 吃掉、改写 next 为 `suspending`、设置 ResumeTime——所以 `work` 里看到的 `err` 已经是 nil，通过 `next == suspending` 走转移回调重新入队（见 2.1）。只有超过重试次数或属于 `CriticalErr` 的错误，才会让 `run` 返回 error，进而 `work` 中 transit 到 `error`。
 
-### 3.4 节点分配：加权轮询（WRR）
+### 3.4 恢复执行的两条路径
+
+`RemoteDownloadTask` 有两个构造函数，对应两种恢复场景，实例复用策略完全不同：
+
+```go
+// 路径 1：用户新提交任务
+func NewRemoteDownloadTask(ctx, src, srcFile, dst string) (queue.Task, error)
+
+// 路径 2：服务重启从 DB 恢复
+func NewRemoteDownloadTaskFromModel(task *ent.Task) queue.Task
+```
+
+**关键区别**：`RemoteDownloadTask` 结构体中有三个字段**不写入 DB**（只在内存存在）：
+
+| 字段 | 类型 | 持久化？ | 作用 |
+|------|------|---------|------|
+| `m.node` | `cluster.Node` | ❌ | 当前选中的节点实例 |
+| `m.d` | `downloader.Downloader` | ❌ | 下载器客户端实例（绑定到具体节点） |
+| `m.state` | `*RemoteDownloadTaskState` | ❌ | `Do()` 执行期间的临时状态，每次重新反序列化 |
+
+而 `m.Task.PrivateState`（JSON 字符串）**会写入 DB**，包含 `Handle`、`Phase`、`NodeID`、`Transferred`、`SlaveUploadTaskID` 等。
+
+基于此，"挂起→恢复"有两条完全不同的路径：
+
+#### 路径 A：同进程内挂起 → 恢复
+
+同进程内 `processing → suspending → processing` 的场景（绝大多数情况）：
+
+1. **`registry.Delete` 只在终态（completed/error/canceled）调用**，`suspending` 转移时**不**删除 Task 实例。
+2. 调度器存储和取出的是**同一个 Task 指针**，实例内存地址不变。
+3. `m.d` 字段保留上一次 `CreateDownloader` 创建的实例，`m.d != nil`。
+4. 但每次 `Do()` 开头都会重新 `json.Unmarshal(m.State(), state)` 重建 `m.state`，并重新 `allocateNode` 选节点。
+
+**同进程内恢复的 Do() 流程**：
+```
+Do()
+  ├─► json.Unmarshal(m.State(), &state)     // 每次重建 m.state
+  ├─► allocateNode → np.Get(cap, state.NodeID)  // 每次重新选节点
+  │      ├─► preferred = state.NodeID（上一次写入 DB 的值）
+  │      └─► 精确匹配成功 → 返回原节点
+  ├─► m.node = 新选节点
+  ├─► if m.d == nil { ... }                 // 同进程内 m.d != nil，跳过！
+  └─► 继续 Phase switch
+```
+
+#### 路径 B：服务重启后从 DB 恢复
+
+进程退出后内存清空，重启时 `queue.Start()` 从 DB 恢复：
+
+1. `GetPendingTasks(ctx, "remote_download")` 从 ent.Task 表查出所有未完成的任务。
+2. 逐个调用 `NewRemoteDownloadTaskFromModel(task)` 创建**全新**的 Task 实例。
+3. 新实例的 `m.d == nil`、`m.node == nil`、`m.state == nil`。
+4. `QueueTask` 重新入调度器，同时 `registry.Set(id, newTaskInstance)`。
+
+**服务重启后首次 Do() 流程**：
+```
+Do()
+  ├─► json.Unmarshal(m.State(), &state)     // 首次反序列化
+  ├─► allocateNode → np.Get(cap, state.NodeID)  // 从 DB 恢复的 NodeID
+  │      ├─► 若原节点仍在 → 精确匹配，返回原节点
+  │      └─► 若原节点已删 → fallback WRR 选新节点，state.NodeID 被更新
+  ├─► m.node = 新选节点
+  ├─► if m.d == nil { ... }                 // 重启后 m.d == nil，执行！
+  │      └─► node.CreateDownloader(...)     // 基于当前选中的节点创建全新 downloader
+  └─► 继续 Phase switch
+```
+
+两条路径的核心差异可以用下表总结：
+
+| 维度 | 同进程内挂起恢复 | 服务重启恢复 |
+|------|-----------------|-------------|
+| Task 实例 | 同一个指针（registry 未删除） | 全新实例（NewFromModel 创建） |
+| `m.d` | 非 nil，不重新 `CreateDownloader` | nil，基于当前节点重新创建 |
+| `m.node` | 每次重新选节点，可能与 m.d 不一致 | 每次重新选节点，与新创建的 m.d 一致 |
+| 状态来源 | 反序列化上一次 Do() 写入的 PrivateState | 反序列化 DB 中最后一次持久化的 PrivateState |
+| Handle 有效性 | 由原节点的下载器持有，若节点未变则有效 | 若原节点未变且下载器未重启则有效；否则失效 |
+
+**代码没有区分这两条路径**，`Do()` 的开头对两种场景走同样的流程。这导致同进程内如果发生节点切换（原节点被删），`m.node` 变成新节点但 `m.d` 还是旧节点的 downloader，两者不一致。
+
+### 3.5 节点分配：加权轮询（WRR）
 
 离线下载任务首次执行（Phase `""`）时，在 `allocateNode`（`pkg/filemanager/workflows/worfklows.go`）中调 `NodePool.Get()` 分配一个具备 `NodeCapabilityRemoteDownload` 能力的节点。实现位于 `pkg/cluster/pool.go`：
 
@@ -395,7 +474,7 @@ Worker 调度循环
 
 ### 6.1 节点切换与旧下载句柄失效
 
-**问题背景**：`RemoteDownloadTask` 结构体中 `node`、`d`（downloader）、`state` 三个字段都不持久化，只有 `Task.PrivateState`（JSON 序列化的 `RemoteDownloadTaskState`）写入 DB。每次 `Do()` 都从 `NewRemoteDownloadTaskFromModel` 重建实例，所以 `m.d` 始终为 nil，每次迭代都基于当前选中的节点重新创建 downloader 实例。
+节点切换的真实行为取决于**是同进程内挂起恢复还是服务重启恢复**（见 3.4 节），两种场景下 `m.d` 是否重建、Handle 是否有效完全不同。
 
 **节点选择流程**（每次 `Do()` 开头，`remote_download.go`）：
 
@@ -410,28 +489,77 @@ allocateNode(ctx, dep, &m.state.NodeState, NodeCapabilityRemoteDownload)
 2. **如果原节点已被管理员停用/删除**：`Upsert` 时会把它从 `p.nodes[capability]` 列表中移除，此时精确匹配失败，`selected == nil`。
 3. Fallback 到 WRR 加权轮询，选一个新节点，回写 `state.NodeID = newNode.ID()`。
 
-**旧 Handle 在新节点上失效的链路**：
+下面分两种场景分析：
+
+#### 场景 A：同进程内节点切换（节点 A 被删 → 重新选节点 B）
+
+同进程内 Task 实例是同一个，`m.d != nil`，所以 `CreateDownloader` **不会**被重新调用。
 
 ```
-节点 A 已停用 → allocateNode 选了节点 B → state.NodeID 改为 B
-    → node.CreateDownloader(ctx, ...) → 创建 B 的 aria2/slave downloader 实例
-    → m.d = newDownloader(B)
-    → switch Phase:
-        case monitor:
-            m.d.Info(ctx, m.state.Handle)
-                │  // Handle 是 A 的 aria2 上创建的，B 的 aria2 不认识
-                ▼
-            返回 ErrTaskNotFount
-                │
-                ├─► state.Status != nil（之前在 A 上已拿到过状态）
-                │       → 判定"用户手动取消" → 返回 StatusCanceled
-                │
-                └─► state.Status == nil（还没来得及在 A 上拿到任何状态）
-                        → GetTaskStatusTried++，ResumeAfter(Interval) 挂起重试
-                        → 连续 5 次后 → 返回 error → 队列级重试（指数退避）
+节点 A 被管理员停用 → np.Get 精确匹配失败 → fallback 选节点 B
+    ├─► state.NodeID 被 allocateNode 更新为 B
+    ├─► m.node = B          // 新节点
+    ├─► m.d == nil? 否      // 同进程内 m.d 还是 A 的 downloader！
+    ├─► switch Phase:
+    │      case monitor:
+    │          m.d.Info(ctx, handle)
+    │              │  // 用 A 的 downloader 去查 A 的 Handle
+    │              │  // 碰巧能查到（Handle 确实在 A 上）
+    │              └─► 返回正常状态
+    └─► 下次 Do():
+           allocateNode → preferred = B（新 NodeID）
+             └─► 精确匹配 B 成功 → 返回 B
+           m.d 还是 A 的 downloader！！  // ← m.node 和 m.d 不一致
+           m.d.Info(handle)
+               │  // A 已被停用，RPC 失败
+               ▼
+           返回错误
+               ├─► GetTaskStatusTried++（最多 5 次）
+               └─► 最终 → error → 队列级重试
 ```
 
-**代码没有"检测到节点切换时自动在新节点重建下载任务"的逻辑**。`createDownloadTask` 中有 `if m.state.Handle != nil { Phase = monitor; return }` 的短路——即只要 Handle 存在就直接进 monitor，不会重新 CreateTask。所以一旦发生节点切换，任务要么被误判为 Canceled（有历史状态），要么重试 5 次后失败。
+**关键不一致**：`m.node` 已经是节点 B，但 `m.d` 还是节点 A 的 downloader。第一次节点切换后的 `Info` 调用碰巧能成功（因为 Handle 确实还在 A 上），但第二次迭代就会因为 A 已停用而 RPC 失败。
+
+#### 场景 B：服务重启后节点切换（节点 A 被删 → 重新选节点 B）
+
+服务重启后 Task 是全新实例，`m.d == nil`，会基于新选的节点重新创建 downloader。
+
+```
+服务重启 → NewRemoteDownloadTaskFromModel → 全新实例
+    ├─► json.Unmarshal → state.NodeID = A, state.Handle = {A 的 GID}
+    ├─► allocateNode → preferred = A
+    │       └─► A 已被删 → fallback 选 B → state.NodeID = B
+    ├─► m.node = B
+    ├─► m.d == nil → 是 → node.CreateDownloader → 创建 B 的 downloader
+    └─► switch Phase:
+            case monitor:
+                m.d.Info(ctx, handle)
+                    │  // 用 B 的 downloader 去查 A 的 GID
+                    ▼
+                返回 ErrTaskNotFount
+                    │
+                    ├─► state.Status != nil（之前在 A 上已拿到过状态）
+                    │       → 判定"用户手动取消" → 返回 StatusCanceled
+                    │
+                    └─► state.Status == nil（还没来得及在 A 上拿到任何状态）
+                            → GetTaskStatusTried++，ResumeAfter(Interval) 挂起重试
+                            → 连续 5 次后 → 返回 error → 队列级重试（指数退避）
+```
+
+#### 共同问题：代码没有"检测到节点切换时自动在新节点重建下载任务"的逻辑
+
+`createDownloadTask` 中有短路：
+```go
+if m.state.Handle != nil {
+    m.state.Phase = RemoteDownloadTaskPhaseMonitor
+    return task.StatusSuspending, nil
+}
+```
+即只要 `Handle` 存在就直接进 monitor，**不会检查当前节点和 Handle 所属节点是否一致**，也不会尝试在新节点上重新创建下载任务。
+
+因此无论哪种场景，只要发生节点切换且 Handle 还在，结果都是：
+- 有历史状态（`state.Status != nil`）→ 误判为 `StatusCanceled`
+- 无历史状态 → 重试 5 次后失败，再走队列级重试（最终还是失败）
 
 slave 模式下 `Info` 返回 `ErrTaskNotFount` 的具体路径（`pkg/downloader/slave/slave.go`）：从节点 RPC 返回 `CodeNotFound` → `fmt.Errorf("%s (%w)", err, downloader.ErrTaskNotFount)`。
 
@@ -496,10 +624,32 @@ Cancel API 调用 ──► 下载器取消任务
 
 **延迟问题**：如果 Task 处于 `suspending` 且 `ResumeTime` 在 1 分钟后，取消操作要等 Worker 下次取到该任务（最长 1 分钟 + `taskPullInterval`）才会生效。代码中没有"取消时主动唤醒调度器立即执行"的机制。
 
-**边界**：
-- Task 不在 registry 中（已结束被清理）→ API 返回 `Task not found`。
-- `Cleanup()` 也会调 `m.d.Cancel()`（兜底），所以即使取消 API 没调用，任务在 completed/error/canceled 时也会通知下载器清理。
-- 如果在 `createDownloadTask` 之前取消（`state.Handle == nil`），`CancelDownload` 直接返回 nil，Task 仍正常走 monitor 流程，下次 `Info` 会因 Handle 为 nil 而出错——实际上 `createDownloadTask` 中 `Handle != nil` 时会短路到 monitor，不会出现 Handle 为 nil 进 monitor 的情况。
+**边界 1：Handle 为空时取消（真实缺陷）**
+
+`CancelDownload` 中 `if m.state.Handle == nil { return nil }` 直接返回 nil（API 层显示取消成功），但 Task 的生命周期丝毫不受影响。
+
+```
+时序：
+  0s:  用户提交下载 → QueueTask → queued
+  0.5s: 调度器取到任务 → processing → Do()
+  0.6s: Do() Phase="" → allocateNode 选了节点 A
+  0.7s: 用户点击 Cancel → CancelDownload → state.Handle == nil → return nil（显示成功）
+  0.8s: Do() 继续 → m.d.CreateTask(...) → 返回 Handle，写入 state.Handle
+  0.9s: state.Phase = "monitor"，return StatusSuspending
+  ...:  下载器正常开始下载
+```
+
+**后果**：用户看到取消成功，但实际上 `CreateTask` 已经执行，下载器已开始干活。下次 `Do()` 进入 monitor 后 `d.Info(handle)` 返回正常的 downloading 状态，任务继续执行。代码中没有"置一个取消标记让 createDownloadTask 跳过"的逻辑。
+
+这个路径是真实存在的，因为 `createDownloadTask` 中只检查 `Handle != nil` 才短路，而 `CancelDownload` 在 Handle 为 nil 时什么都不做，两者没有联动。
+
+**边界 2：Task 不在 registry 中**
+
+`registry.Get(taskID)` 找不到 → API 返回 `Task not found`。registry 删除发生在 `processing → completed/error/canceled` 转移回调中，所以已结束的任务无法取消。
+
+**边界 3：Cleanup 兜底**
+
+`processing → completed/error/canceled` 转移回调中会统一调 `task.Cleanup()`，`RemoteDownloadTask.Cleanup()` 会再次调 `m.d.Cancel(ctx, handle)` 兜底，所以即使取消 API 没调用，任务结束时也会通知下载器清理。
 
 ### 6.4 落盘前校验与触发时机
 
@@ -573,7 +723,9 @@ monitor 轮询
 2. **`fifoScheduler` 实际是只看栈顶到期时间的 LIFO 栈，不是堆也不是 FIFO。** `Less` 方法是死代码；晚提交、短 ResumeTime 的任务会被优先取出，早提交的任务可能被压栈。
 3. **重试分两层：** 业务层轻量重试（如状态查询，5 次以内，短周期）失败后才交给队列层指数退避；致命错误用 `CriticalErr` 哨兵直接跳过重试。
 4. **断点续传以单文件为粒度：** `Transferred map[int]` 记录成功索引，Master 本地传与 Slave RPC 传均遵循此约定，失败重跑不会重复传已落盘的文件。
-5. **恢复能力依赖 PrivateState JSON 持久化：** Phase、Handle、NodeID、Transferred、SlaveUploadTaskID 等全量保存在 DB 中，进程重启后 `GetPendingTasks` 恢复即可无缝继续。
-6. **节点切换是未处理的边界缺陷：** 旧 Handle 在新节点上无效，有历史状态时被判 Canceled，无历史状态时重试 5 次后失败。代码没有检测节点切换并重建下载任务的逻辑。
-7. **文件选择、取消操作绕过队列直接操作下载器：** 通过内存 `TaskRegistry` 同步调用，不改变 PrivateState；效果在下一次 `monitor` 轮询中通过 `d.Info()` 返回值感知。取消是异步生效的，延迟取决于 ResumeTime。
-8. **落盘前校验在 monitor 阶段触发：** 首次拿到状态或 Total 变化时校验容量、扩展名、命名，失败直接 `CriticalErr` 不重试，避免下载完成后才发现无法传输。
+5. **恢复能力依赖 PrivateState JSON 持久化：** Phase、Handle、NodeID、Transferred、SlaveUploadTaskID 等全量保存在 DB 中，进程重启后 `GetPendingTasks` 恢复即可继续。
+6. **恢复执行分同进程挂起和服务重启两条路径：** 同进程内 Task 实例复用、`m.d` 保留；服务重启后新建实例、`m.d` 重建。代码未区分两条路径，导致同进程内节点切换时 `m.node` 和 `m.d` 不一致。
+7. **节点切换是未处理的边界缺陷：** 旧 Handle 在新节点上无效，服务重启后会被判 `Canceled` 或重试失败；同进程内切换还可能出现 `m.node` 是新节点但 `m.d` 还是旧节点 downloader 的不一致。`createDownloadTask` 只看 Handle 是否存在，不检查节点匹配性，不会自动重建下载任务。
+8. **文件选择、取消操作绕过队列直接操作下载器：** 通过内存 `TaskRegistry` 同步调用，不改变 PrivateState；效果在下一次 `monitor` 轮询中通过 `d.Info()` 返回值感知。取消是异步生效的，延迟取决于 ResumeTime。
+9. **取消时 Handle 为空是真实缺陷：** `CancelDownload` 在 `Handle == nil` 时直接返回 nil（显示成功），但后续 `createDownloadTask` 仍会正常创建 Handle 并开始下载，等于取消静默失效。两者没有联动标记。
+10. **落盘前校验在 monitor 阶段触发：** 首次拿到状态或 Total 变化时校验容量、扩展名、命名，失败直接 `CriticalErr` 不重试，避免下载完成后才发现无法传输。
